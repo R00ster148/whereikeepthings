@@ -1,0 +1,27 @@
+name = "neon-breach"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Files in ./public (the game page) are served for free and don't count toward limits.
+[assets]
+directory = "./public"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[durable_objects.bindings]]
+name = "BOARD"
+class_name = "Board"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Board"]
+
+# Admin accounts (your in-game names, comma separated). Only these can use /commands.
+[vars]
+ADMINS = "R005ter123"

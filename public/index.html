@@ -1,0 +1,2514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Breach</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #02020a; overflow: hidden; }
+  canvas { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+// ---------- Config ----------
+const W = 1000, H = 750, CHUNK = 800, STEP = 1 / 60;
+// Other players and enemies are drawn this many ms in the past, so there's always a next position to glide to
+const DELAY = 110; // starting playback delay; each player's actual delay adapts to their connection
+const NADE_SHOTS = 24, NADE_CD = 480;
+// PvP free-for-all: fixed arena, first to KILLS_TO_WIN, bullet damage decided by the player who gets hit
+const TEAM_COLORS = [[40, 150, 255], [255, 60, 70]], TEAM_NAMES = ["Blue", "Red"], TDM_TO_WIN = 30;
+const ARENA = 1200, KILLS_TO_WIN = 15, PVP_DMG = 8, PVP_NADE_DMG = 12, PVP_RESPAWN = 3;
+let arena = false; // grenade: 24 shots, recharges in 8 seconds
+const SEND_HZ = 15, MAX_SHOTS = 4, KEEPALIVE_MS = 30000, MAX_PLAYERS = 8, MAX_ENEMIES = 80, MAX_EVENTS = 20;
+const ROOM_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const TAU = Math.PI * 2;
+const C = {
+  bg: "#02020a", white: [255, 255, 255],
+  weak: [255, 220, 50], mid: [255, 50, 150], strong: [180, 50, 255],
+  wall: "#141428", wallEdge: "#0096ff", death: "#ff0032",
+  starNear: "#6464c8", starFar: "#282850",
+  text: "#e6f0ff", muted: "#7f8bb0", panel: "rgba(8,10,28,0.78)", edge: "rgba(0,200,255,0.35)",
+  green: [0, 255, 120], accent: [0, 255, 255], gold: [255, 200, 60], silver: [190, 200, 225],
+};
+// Player colours: index 0 (blue) goes to whoever opens the room, the rest are handed out randomly by the server
+const PALETTE = [
+  [0, 220, 255],   // blue
+  [70, 255, 120],  // green
+  [255, 70, 80],   // red
+  [255, 225, 60],  // yellow
+  [255, 150, 40],  // orange
+  [185, 100, 255], // purple
+  [255, 110, 210], // pink
+  [235, 240, 255], // white
+];
+const FONT = "'Chakra Petch', 'Segoe UI', sans-serif";
+const f = (size, weight = 600) => `${weight} ${size}px ${FONT}`;
+const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const rand = (a, b) => a + Math.random() * (b - a);
+const pal = i => PALETTE[i] || PALETTE[0];
+
+// ---------- Canvas + input ----------
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H), dpr = Math.min(2, devicePixelRatio || 1); // 3x screens don't need 3x the pixels
+  cv.style.width = W * s + "px"; cv.style.height = H * s + "px";
+  cv.width = Math.round(W * s * dpr); cv.height = Math.round(H * s * dpr);
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+}
+addEventListener("resize", resize); resize();
+
+const keys = new Set(), mouse = { x: -1, y: -1, down: false };
+let usingMouse = false;
+addEventListener("keydown", e => {
+  if (["Space", "Backspace", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+  const typing = state === "PLAY" && G && G.chatting;
+  if (!e.repeat || typing) onKey(e);
+  if (!typing) keys.add(e.code);
+});
+addEventListener("keyup", e => keys.delete(e.code));
+addEventListener("blur", () => { keys.clear(); mouse.down = false; });
+// Switching tabs stops the game loop, so pause and tell everyone straight away
+document.addEventListener("visibilitychange", () => {
+  if (state !== "PLAY" || !G) return;
+  G.away = document.hidden; // hidden players can't run enemies, so hosting moves to someone else
+  if (document.hidden && !G.paused) pause();
+  sendState(G, true);
+});
+addEventListener("mousemove", e => {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) / r.width * W; mouse.y = (e.clientY - r.top) / r.height * H;
+  usingMouse = true;
+});
+cv.addEventListener("mousedown", e => {
+  if (e.button !== 0) return;
+  const b = buttons.find(b => hit(b));
+  if (b) { if (!b.disabled) b.action(); return; }
+  if (state === "PLAY" && G && !G.paused) mouse.down = true;
+});
+addEventListener("mouseup", e => { if (e.button === 0) mouse.down = false; });
+const hit = b => mouse.x >= b.x && mouse.x <= b.x + b.w && mouse.y >= b.y && mouse.y <= b.y + b.h;
+
+// ---------- Helpers ----------
+class V {
+  constructor(x = 0, y = 0) { this.x = x; this.y = y; }
+  set(x, y) { this.x = x; this.y = y; return this; }
+  dist(o) { return Math.hypot(this.x - o.x, this.y - o.y); }
+}
+function hashStr(s) { let h = 2166136261; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
+function mulberry32(a) {
+  return () => { a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function overlaps(p, h, w) { return p.x - h < w.x + w.w && p.x + h > w.x && p.y - h < w.y + w.h && p.y + h > w.y; }
+function moveBox(p, h, dx, dy, walls) {
+  if (dx) { p.x += dx; for (const w of walls) if (overlaps(p, h, w)) p.x = dx > 0 ? w.x - h : w.x + w.w + h; }
+  if (dy) { p.y += dy; for (const w of walls) if (overlaps(p, h, w)) p.y = dy > 0 ? w.y - h : w.y + w.h + h; }
+}
+const num = v => typeof v === "number" && isFinite(v);
+
+// Smooth rendering: the game logic runs 60 times a second, the screen may refresh faster.
+// alpha = how far we are between the last two logic steps; drawings blend between them.
+let alpha = 1;
+const lerpX = o => o.ox + (o.pos.x - o.ox) * alpha, lerpY = o => o.oy + (o.pos.y - o.oy) * alpha;
+
+// Buffer of timestamped positions (and velocities) for things we get from the network, played back a little in the past.
+// If the next update is late, it keeps gliding along the last known velocity for a moment instead of freezing.
+class Track {
+  constructor() { this.buf = []; }
+  push(t, x, y, vx = null, vy = null) {
+    const b = this.buf, last = b[b.length - 1];
+    if (last) {
+      if (Math.hypot(x - last.x, y - last.y) > 400) b.length = 0;             // respawn / teleport: jump
+      else if (t - last.t > 250) b.push({ t: t - 17, x: last.x, y: last.y, vx: 0, vy: 0 }); // was standing still until just now
+      else if (t <= last.t) t = last.t + 1;
+    }
+    b.push({ t, x, y, vx, vy });
+    if (b.length > 16) b.splice(0, b.length - 16);
+  }
+  sample(t, out) {
+    const b = this.buf;
+    if (!b.length) return out;
+    if (t <= b[0].t) return out.set(b[0].x, b[0].y);
+    for (let i = b.length - 1; i >= 0; i--) {
+      if (b[i].t <= t) {
+        const a = b[i], c = b[i + 1];
+        if (!c) { // ran out of data: extrapolate up to 150 ms
+          let vx = a.vx, vy = a.vy;
+          if (vx === null && i > 0) { const p = b[i - 1], d = Math.max(1, a.t - p.t); vx = (a.x - p.x) / d; vy = (a.y - p.y) / d; }
+          const dt = Math.min(t - a.t, 150);
+          return out.set(a.x + (vx || 0) * dt, a.y + (vy || 0) * dt);
+        }
+        const k = (t - a.t) / (c.t - a.t);
+        return out.set(a.x + (c.x - a.x) * k, a.y + (c.y - a.y) * k);
+      }
+    }
+    return out;
+  }
+}
+
+// ---------- Drawing helpers ----------
+function text(s, x, y, font, color, align = "left", base = "top") {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = base; ctx.fillText(s, x, y);
+}
+function chamfer(x, y, w, h, c) {
+  ctx.beginPath(); ctx.moveTo(x + c, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + h - c);
+  ctx.lineTo(x + w - c, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + c); ctx.closePath();
+}
+function panel(x, y, w, h, c = 10, stroke = C.edge) {
+  chamfer(x, y, w, h, c); ctx.fillStyle = C.panel; ctx.fill();
+  ctx.strokeStyle = stroke; ctx.lineWidth = 1; ctx.stroke();
+}
+function segBar(x, y, w, h, frac, color, segs = 20) {
+  const gap = 2, sw = (w - gap * (segs - 1)) / segs, on = Math.ceil(Math.max(0, frac) * segs);
+  for (let i = 0; i < segs; i++) {
+    ctx.fillStyle = i < on ? color : "rgba(255,255,255,0.07)";
+    ctx.fillRect(x + i * (sw + gap), y, sw, h);
+  }
+}
+function vignette(color, alpha) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, H * 0.85);
+  g.addColorStop(0, rgb(color, 0)); g.addColorStop(1, rgb(color, alpha));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+let buttons = [], sel = 0;
+function button(label, hint, x, y, w, h, action, disabled = false) {
+  const i = buttons.length;
+  const b = { x, y, w, h, action, disabled };
+  buttons.push(b);
+  if (usingMouse && hit(b)) sel = i;
+  const on = sel === i && !disabled;
+  chamfer(x, y, w, h, 12);
+  ctx.fillStyle = on ? "rgba(0,255,255,0.12)" : "rgba(8,10,28,0.8)"; ctx.fill();
+  ctx.strokeStyle = on ? rgb(C.accent) : "rgba(127,139,176,0.4)"; ctx.lineWidth = on ? 2 : 1; ctx.stroke();
+  if (on) { ctx.fillStyle = rgb(C.accent); ctx.fillRect(x + 1, y + 14, 3, h - 15); }
+  const col = disabled ? "rgba(127,139,176,0.5)" : on ? rgb(C.accent) : C.text;
+  text(label, x + 26, y + h / 2 + 1, f(20, 600), col, "left", "middle");
+  if (hint) text(hint, x + w - 20, y + h / 2 + 1, f(14, 600), C.muted, "right", "middle");
+}
+
+// ---------- World (same seed everywhere = same walls for every player) ----------
+const chunks = new Map();
+function chunkData(x, y) {
+  const k = x + "," + y;
+  let c = chunks.get(k);
+  if (c) return c;
+  const r = mulberry32(hashStr(`${x}_${y}_neon_v2`)), ri = (a, b) => a + Math.floor(r() * (b - a + 1));
+  const walls = [], decor = [], bx = x * CHUNK, by = y * CHUNK;
+  const n = ri(2, 3);
+  for (let i = 0; i < n; i++) {
+    const ox = bx + ri(60, 540), oy = by + ri(60, 540), kind = r();
+    if (kind < 0.32) walls.push({ x: ox, y: oy, w: ri(110, 220), h: ri(110, 220) });              // block
+    else if (kind < 0.58) {                                                                         // L-shape
+      const L = ri(180, 300), T = ri(36, 50), S = ri(110, 190), right = r() < 0.5;
+      walls.push({ x: ox, y: oy, w: L, h: T });
+      walls.push({ x: right ? ox + L - T : ox, y: oy + T, w: T, h: S });
+    } else if (kind < 0.8) {                                                                        // long bar
+      const long = ri(240, 380), thick = ri(34, 46);
+      walls.push(r() < 0.5 ? { x: ox, y: oy, w: long, h: thick } : { x: ox, y: oy, w: thick, h: long });
+    } else {                                                                                        // row of pillars
+      const k2 = ri(2, 4), sz = ri(46, 64), gap = ri(70, 100), vert = r() < 0.5;
+      for (let j = 0; j < k2; j++) walls.push({ x: ox + (vert ? 0 : j * (sz + gap)), y: oy + (vert ? j * (sz + gap) : 0), w: sz, h: sz });
+    }
+  }
+  for (let i = ri(3, 6); i > 0; i--) decor.push({ x: bx + ri(0, 799), y: by + ri(0, 799), k: ri(0, 2) });
+  c = { walls, decor };
+  chunks.set(k, c);
+  return c;
+}
+const nearCache = new Map();
+function getWalls(p) {
+  const cx = Math.floor(p.x / CHUNK), cy = Math.floor(p.y / CHUNK), key = cx + "," + cy;
+  const hitCache = nearCache.get(key);
+  if (hitCache) return hitCache;
+  const out = [];
+  nearCache.set(key, out);
+  for (let x = cx - 1; x <= cx + 1; x++) for (let y = cy - 1; y <= cy + 1; y++) {
+    const k = x + "," + y;
+    for (const w of chunkData(x, y).walls) out.push(w);
+  }
+  return out;
+}
+// ---------- Enemy pathfinding ----------
+// The host builds a "flow field" a few times a second: a grid around the players where every open cell knows
+// how many steps it is from the nearest player. Enemies just walk downhill, so they go around walls instead of into them.
+const CELL = 40, CPC = CHUNK / CELL;
+const blockCache = new Map();
+function chunkBlock(kx, ky) {
+  const key = kx + "," + ky;
+  let arr = blockCache.get(key);
+  if (arr) return arr;
+  arr = new Uint8Array(CPC * CPC);
+  const walls = getWalls({ x: kx * CHUNK + CHUNK / 2, y: ky * CHUNK + CHUNK / 2 }), pad = 14, core = 8;
+  for (let j = 0; j < CPC; j++) for (let i = 0; i < CPC; i++) {
+    const cx0 = (kx * CPC + i) * CELL, cy0 = (ky * CPC + j) * CELL;
+    let v = 0;
+    for (const w of walls) {
+      // middle of the cell inside a wall = solid; anywhere near one = "close to a wall"
+      if (cx0 + core < w.x + w.w && cx0 + CELL - core > w.x && cy0 + core < w.y + w.h && cy0 + CELL - core > w.y) { v = 2; break; }
+      if (cx0 - pad < w.x + w.w && cx0 + CELL + pad > w.x && cy0 - pad < w.y + w.h && cy0 + CELL + pad > w.y) v = 1;
+    }
+    arr[j * CPC + i] = v;
+  }
+  blockCache.set(key, arr);
+  return arr;
+}
+const DIRS8 = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+function buildField(g, targets) {
+  if (!targets.length) { g.field = null; return; }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const t of targets) { minX = Math.min(minX, t.x); maxX = Math.max(maxX, t.x); minY = Math.min(minY, t.y); maxY = Math.max(maxY, t.y); }
+  const MAXC = 180, pad = 1300;
+  let x0 = Math.floor((minX - pad) / CELL), x1 = Math.ceil((maxX + pad) / CELL), y0 = Math.floor((minY - pad) / CELL), y1 = Math.ceil((maxY + pad) / CELL);
+  if (x1 - x0 > MAXC) { const c = Math.round((minX + maxX) / 2 / CELL); x0 = c - MAXC / 2; x1 = c + MAXC / 2; }
+  if (y1 - y0 > MAXC) { const c = Math.round((minY + maxY) / 2 / CELL); y0 = c - MAXC / 2; y1 = c + MAXC / 2; }
+  const w = x1 - x0 + 1, h = y1 - y0 + 1, n = w * h;
+  const blk = new Uint8Array(n), dist = new Int32Array(n).fill(-1);
+  for (let ky = Math.floor(y0 / CPC); ky <= Math.floor(y1 / CPC); ky++) for (let kx = Math.floor(x0 / CPC); kx <= Math.floor(x1 / CPC); kx++) {
+    const arr = chunkBlock(kx, ky);
+    for (let j = 0; j < CPC; j++) {
+      const gy = ky * CPC + j - y0; if (gy < 0 || gy >= h) continue;
+      for (let i = 0; i < CPC; i++) { const gx = kx * CPC + i - x0; if (gx >= 0 && gx < w) blk[gy * w + gx] = arr[j * CPC + i]; }
+    }
+  }
+  const buckets = [];
+  let pending = 0;
+  const push = (d, i) => { (buckets[d] || (buckets[d] = [])).push(i); pending++; };
+  for (const t of targets) {
+    const cx = Math.floor(t.x / CELL) - x0, cy = Math.floor(t.y / CELL) - y0;
+    if (cx >= 0 && cy >= 0 && cx < w && cy < h && dist[cy * w + cx] < 0) { dist[cy * w + cx] = 0; push(0, cy * w + cx); }
+  }
+  for (let cur = 0; pending > 0 && cur < 30000; cur++) {
+    const bucket = buckets[cur];
+    if (!bucket) continue;
+    while (bucket.length) {
+      const idx = bucket.pop(); pending--;
+      if (dist[idx] !== cur) continue; // already reached more cheaply
+      const cx = idx % w, cy = (idx / w) | 0;
+      for (const [dx, dy] of DIRS8) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const ni = ny * w + nx;
+        if (blk[ni] === 2) continue;
+        if (dx && dy && (blk[cy * w + nx] === 2 || blk[ny * w + cx] === 2)) continue; // don't cut through corners
+        const nd = cur + (blk[ni] ? (dx && dy ? 7 : 5) : (dx && dy ? 3 : 2));
+        if (dist[ni] < 0 || nd < dist[ni]) { dist[ni] = nd; push(nd, ni); }
+      }
+    }
+  }
+  g.field = { x0, y0, w, h, dist, blk };
+}
+// Which way should this enemy walk? Downhill on the field, looking a few cells ahead for smooth turns.
+function navDir(g, e, best, bd) {
+  const F = g.field, direct = [(best.x - e.pos.x) / bd, (best.y - e.pos.y) / bd];
+  if (!F || bd < 90) return direct;
+  let px = Math.floor(e.pos.x / CELL) - F.x0, py = Math.floor(e.pos.y / CELL) - F.y0;
+  if (px < 0 || py < 0 || px >= F.w || py >= F.h) return direct;
+  const at = (x, y) => (x < 0 || y < 0 || x >= F.w || y >= F.h) ? -1 : F.dist[y * F.w + x];
+  const solid = (x, y) => x < 0 || y < 0 || x >= F.w || y >= F.h || F.blk[y * F.w + x] === 2;
+  const centre = (x, y) => [(x + F.x0 + 0.5) * CELL, (y + F.y0 + 0.5) * CELL];
+  if (at(px, py) >= 0 && at(px, py) <= 4) return direct;
+  const sx = px, sy = py, pressed = at(px, py) < 0; // pressed against a wall: its own cell counts as solid
+  if (pressed) {
+    // Feel around in 16 directions for the lowest reachable spot (never through a wall), leaning toward the player on ties
+    let bestDir = null, bestScore = Infinity;
+    for (let i = 0; i < 16; i++) {
+      const a = i * TAU / 16, ux = Math.cos(a), uy = Math.sin(a), qx = e.pos.x + ux * 36, qy = e.pos.y + uy * 36;
+      const d = at(Math.floor(qx / CELL) - F.x0, Math.floor(qy / CELL) - F.y0);
+      if (d < 0 || !clearPath(e.pos.x, e.pos.y, qx, qy, e.size * 0.8)) continue;
+      const score = d - 0.5 * (ux * direct[0] + uy * direct[1]);
+      if (score < bestScore) { bestScore = score; bestDir = [ux, uy]; }
+    }
+    return bestDir || direct;
+  }
+  for (let step = 0; step < 3; step++) {
+    let bestD = at(px, py) < 0 ? Infinity : at(px, py), bx = px, by = py;
+    for (const [dx, dy] of DIRS8) {
+      const nx = px + dx, ny = py + dy, nd = at(nx, ny);
+      if (nd < 0 || nd >= bestD || solid(nx, ny)) continue;
+      if (dx && dy && !pressed && (solid(px + dx, py) || solid(px, py + dy))) continue; // no squeezing through corners
+      // first step out of a wall-hugging spot must be reachable in a straight line (not on the far side of a thin wall)
+      bestD = nd; bx = nx; by = ny;
+    }
+    if (bx === px && by === py) break;
+    // only look further ahead while the enemy's whole body could actually get there in a straight line
+    if (step > 0) { const [cx, cy] = centre(bx, by); if (!clearPath(e.pos.x, e.pos.y, cx, cy, e.size * 0.8)) break; }
+    px = bx; py = by;
+  }
+  if (px === sx && py === sy) return direct; // no way found from here: go straight at them
+  const vx = (px + F.x0 + 0.5) * CELL - e.pos.x, vy = (py + F.y0 + 0.5) * CELL - e.pos.y, l = Math.hypot(vx, vy);
+  return l < 1 ? direct : [vx / l, vy / l];
+}
+
+function clearLine(x0, y0, x1, y1) { // true if no wall sits between the two points
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 8);
+  for (let i = 1; i <= n; i++) if (wallAt(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n)) return false;
+  return true;
+}
+function clearPath(x0, y0, x1, y1, r) { // same, for something r pixels wide (checks both edges too)
+  const l = Math.hypot(x1 - x0, y1 - y0) || 1, ox = -(y1 - y0) / l * r, oy = (x1 - x0) / l * r;
+  return clearLine(x0, y0, x1, y1) && clearLine(x0 + ox, y0 + oy, x1 + ox, y1 + oy) && clearLine(x0 - ox, y0 - oy, x1 - ox, y1 - oy);
+}
+function freeSpotNear(cx, cy, minR = 0) {
+  const a0 = Math.random() * TAU;
+  for (let r = minR; r < 1500; r += 30) {
+    for (let i = 0; i < 12; i++) {
+      const a = a0 + i * TAU / 12, p = new V(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+      if (!getWalls(p).some(w => overlaps(p, 18, w))) return p;
+      if (r === 0) break;
+    }
+  }
+  return new V(cx, cy);
+}
+function teamSpawn(mates) {
+  if (mates.length) { const m = mates[Math.random() * mates.length | 0]; return freeSpotNear(m[0], m[1], 45); }
+  return freeSpotNear(W / 2, H / 2);
+}
+
+// ---------- Progression data ----------
+// Ranks are saved in this browser, so they carry over between games
+const RANKS = [
+  "Recruit", "Scout", "Runner", "Breacher", "Striker", "Specter", "Vanguard", "Sentry", "Overclock", "Phantom",
+  "Apex", "Singularity", "Voidwalker", "Nightfall", "Ironclad", "Tempest", "Eclipse", "Paragon", "Leviathan", "Oblivion",
+  "Ascendant", "Celestial", "Nova", "Quasar", "Pulsar", "Supernova", "Event Horizon", "Infinity", "Omega", "Neon God",
+];
+const RANK_XP = [
+  0, 2000, 6000, 12000, 20000, 32000, 50000, 76000, 110000, 156000,
+  220000, 300000, 400000, 540000, 720000, 960000, 1280000, 1700000, 2200000, 2900000,
+  3800000, 5000000, 6600000, 8600000, 11200000, 14600000, 19000000, 25000000, 33000000, 44000000,
+];
+let xp = 0;
+try { xp = Math.max(0, parseInt(localStorage.getItem("nb_xp") || "0", 10) || 0); } catch {}
+const rankOf = x => { let r = 0; for (let i = 0; i < RANK_XP.length; i++) if (x >= RANK_XP[i]) r = i; return r; };
+function addXp(n) {
+  const before = rankOf(xp);
+  xp += Math.round(n);
+  try { localStorage.setItem("nb_xp", String(xp)); } catch {}
+  const after = rankOf(xp);
+  if (after > before && G) banner(`Rank up: ${RANKS[after]}`, "New trail colour unlocked", trailColor(after, C.gold, 0.5));
+}
+// Every 4 ranks the badge changes colour: silver, cyan, gold, crimson, violet, white-hot, then shifting rainbow
+function hue(h) { // 0..1 -> rgb
+  const f = n => { const k = (n + h * 12) % 12; return Math.round(255 * (0.5 - 0.5 * Math.max(-1, Math.min(k - 3, 9 - k, 1)))); };
+  return [f(0), f(8), f(4)];
+}
+const TIER_COLORS = [C.silver, C.accent, C.gold, [255, 70, 90], [190, 110, 255], [255, 255, 255]];
+const badgeColor = r => r >= 24 ? hue((anim * (r >= 28 ? 0.06 : 0.03)) % 1) : TIER_COLORS[Math.floor(r / 4)];
+function drawBadge(x, y, r, s = 1) { // chevrons: 1-4 per tier
+  const n = r % 4 + 1, col = rgb(badgeColor(r));
+  ctx.save();
+  if (r >= 20) { ctx.shadowColor = col; ctx.shadowBlur = r >= 28 ? 12 : 6; }
+  ctx.strokeStyle = col; ctx.lineWidth = 2 * s; ctx.lineJoin = "miter";
+  for (let i = 0; i < n; i++) {
+    const yy = y + 4 * s - i * 4 * s;
+    ctx.beginPath(); ctx.moveTo(x - 6 * s, yy - 3 * s); ctx.lineTo(x, yy + 1 * s); ctx.lineTo(x + 6 * s, yy - 3 * s); ctx.stroke();
+  }
+  if (r >= 28) { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y - 14 * s, 2.5 * s, 0, TAU); ctx.fill(); } // crown dot for the top two
+  ctx.restore();
+}
+
+const UPGRADES = [
+  { k: "rate", name: "Rapid fire", desc: "Shoot faster", max: 4 },
+  { k: "dmg", name: "Heavy rounds", desc: "+1 damage per bullet", max: 5 },
+  { k: "multi", name: "Spread shot", desc: "+1 bullet per shot", max: 3 },
+  { k: "speed", name: "Thrusters", desc: "Move faster", max: 4 },
+  { k: "hull", name: "Plating", desc: "+25 max hull and full repair", max: 4 },
+  { k: "regen", name: "Nano repair", desc: "Slowly regain hull", max: 4 },
+];
+const maxHp = g => 100 + 25 * g.up.hull;
+const shotDelay = g => Math.max(3, 7 - g.up.rate);
+// Dash and grenade get a little better with every level cleared (not in PvP)
+const cleared = g => g.pvp ? 0 : Math.max(0, g.lv.level - 1);
+const dashDelay = g => Math.max(25, 45 - cleared(g));                    // 0.75s -> 0.42s
+const nadeShots = g => Math.min(48, NADE_SHOTS + cleared(g));            // 24 -> 48 shots
+const nadeDelay = g => Math.max(240, NADE_CD - 8 * cleared(g));          // 8s -> 4s
+const nadeDmg = g => (1 + g.up.dmg) * Math.min(3, 2 + 0.05 * cleared(g)); // x2 -> x3 your bullet damage
+
+// Enemy types. 4 shoots back, 9-11 are bosses.
+const TIERS = {
+  1: { hp: 3, speed: 4.4, size: 10, color: C.weak, pts: 150, xp: 5 },
+  2: { hp: 10, speed: 2.8, size: 18, color: C.mid, pts: 300, xp: 10 },
+  3: { hp: 30, speed: 1.4, size: 30, color: C.strong, pts: 450, xp: 18 },
+  4: { hp: 9, speed: 2.0, size: 14, color: [255, 110, 40], pts: 400, xp: 15, shooter: true, dmg: 12 },
+  5: { hp: 4, speed: 5.0, size: 13, color: [255, 50, 30], pts: 350, xp: 12, kamikaze: true, blast: 115, blastDmg: 45, name: "Kamikaze" },
+  6: { hp: 8, speed: 2.5, size: 14, color: [140, 255, 60], pts: 350, xp: 12, dasher: true, name: "Dasher" },
+  7: { hp: 18, speed: 2.2, size: 22, color: [0, 230, 200], pts: 400, xp: 12, splitter: true, name: "Splitter" },
+  8: { hp: 3, speed: 4.8, size: 9, color: [0, 230, 200], pts: 100, xp: 4, piece: true },
+  9: { hp: 300, speed: 1.1, size: 50, color: [255, 60, 90], pts: 5000, xp: 200, boss: "The Sentinel", dmg: 16 },
+  10: { hp: 300, speed: 1.4, size: 46, color: [60, 255, 210], pts: 5000, xp: 200, boss: "The Hydra", dmg: 16 },
+  11: { hp: 300, speed: 1.2, size: 52, color: [255, 200, 60], pts: 5000, xp: 200, boss: "The Overseer", dmg: 18 },
+};
+const tierOf = t => TIERS[t] || TIERS[1];
+
+// ---------- Entities ----------
+class Stars {
+  constructor(n, col, m) { this.s = Array.from({ length: n }, () => new V(Math.random() * W, Math.random() * H)); this.col = col; this.m = m; }
+  update(dx, dy) { for (const s of this.s) { s.x = ((s.x - dx * this.m) % W + W) % W; s.y = ((s.y - dy * this.m) % H + H) % H; } }
+  draw(a) {
+    ctx.fillStyle = this.col;
+    for (const s of this.s) { ctx.beginPath(); ctx.arc(s.x | 0, (s.y + Math.sin(a + s.x * 0.01) * 2) | 0, 1, 0, TAU); ctx.fill(); }
+  }
+}
+const near = new Stars(25, C.starNear, 0.4), far = new Stars(50, C.starFar, 0.1);
+
+class Particle {
+  constructor(x, y, color, sp = 1) {
+    const a = rand(0, TAU), v = rand(2, 6) * sp;
+    this.pos = new V(x, y); this.ox = x; this.oy = y; this.vx = Math.cos(a) * v; this.vy = Math.sin(a) * v; this.life = 255; this.color = color;
+  }
+  update() { this.ox = this.pos.x; this.oy = this.pos.y; this.pos.x += this.vx; this.pos.y += this.vy; this.life -= 10; }
+  draw(cam) { if (this.life > 0) { ctx.fillStyle = rgb(this.color, this.life / 255); ctx.fillRect(lerpX(this) - cam.x, lerpY(this) - cam.y, 4, 4); } }
+}
+
+function wallAt(x, y) {
+  for (const w of getWalls({ x, y })) if (x >= w.x && x < w.x + w.w && y >= w.y && y < w.y + w.h) return w;
+  return null;
+}
+
+// Every client runs the same bullet physics, so bullets look identical everywhere
+class Bullet {
+  constructor(x, y, a, color, remote, dmg = 1, life = 180, owner = null, nade = false) {
+    this.pos = new V(x, y); this.ox = x; this.oy = y; this.vx = Math.cos(a) * 11; this.vy = Math.sin(a) * 11;
+    this.color = color; this.remote = remote; this.dmg = dmg; this.life = life; this.owner = owner; this.nade = nade;
+  }
+  update() {
+    this.life--; this.ox = this.pos.x; this.oy = this.pos.y;
+    for (let i = 0; i < 3; i++) {
+      const nx = this.pos.x + this.vx / 3, ny = this.pos.y + this.vy / 3, w = wallAt(nx, ny);
+      if (arena && (Math.abs(nx) > ARENA || Math.abs(ny) > ARENA)) { // bounce off the arena edge
+        if (Math.abs(nx) > ARENA) this.vx *= -1; else this.vy *= -1;
+        break;
+      }
+      if (w) {
+        if (Math.abs(nx - w.x) < 5 || Math.abs(nx - (w.x + w.w)) < 5) this.vx *= -1; else this.vy *= -1;
+        break;
+      }
+      this.pos.set(nx, ny);
+    }
+  }
+  draw(cam) {
+    const x = lerpX(this) - cam.x, y = lerpY(this) - cam.y;
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(x, y, 4, 0, TAU); ctx.fill();
+    ctx.strokeStyle = rgb(this.color); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, TAU); ctx.stroke();
+  }
+}
+
+// Shots fired by enemies. Created from the host's events on every screen.
+class EnemyShot {
+  constructor(x, y, a, spd, tier) {
+    const T = tierOf(tier);
+    this.pos = new V(x, y); this.ox = x; this.oy = y; this.vx = Math.cos(a) * spd; this.vy = Math.sin(a) * spd;
+    this.color = T.color; this.dmg = T.dmg || 8; this.life = 240;
+  }
+  update() {
+    this.life--; this.ox = this.pos.x; this.oy = this.pos.y;
+    this.pos.x += this.vx; this.pos.y += this.vy;
+    if (wallAt(this.pos.x, this.pos.y)) this.life = 0;
+  }
+  draw(cam) {
+    const x = lerpX(this) - cam.x, y = lerpY(this) - cam.y;
+    ctx.fillStyle = rgb(this.color, 0.35); ctx.beginPath(); ctx.arc(x, y, 8, 0, TAU); ctx.fill();
+    ctx.fillStyle = rgb(this.color); ctx.beginPath(); ctx.arc(x, y, 5, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(x, y, 2, 0, TAU); ctx.fill();
+  }
+}
+
+// Enemies are shared: the host moves them, everyone else follows the host's positions
+class Enemy {
+  constructor(id, x, y, tier, hp) {
+    this.id = id; this.pos = new V(x, y); this.t = new V(x, y); this.ox = x; this.oy = y; this.track = new Track(); this.flash = 0;
+    this.setTier(tier); this.hp = hp ?? this.hp; this.maxHp = this.hp;
+    this.wt = rand(0.5, 1.5); this.wa = rand(0, TAU); this.la = rand(0, TAU);
+    this.cd = rand(1, 2); this.cd2 = 4; this.burst = 0; this.wind = 0; this.charge = 0; this.cx = 0; this.cy = 0;
+    this.phase = 0; this.spin = 0; this.shield = false; this.windup = false; this.chain = 0; this.owner = null;
+    this.stuck = 0; this.detour = 0; this.dtx = 0; this.dty = 0; this.fuse = 0; this.face = 0;
+  }
+  setTier(tier) {
+    const T = tierOf(tier);
+    if (this.tier !== tier) this.hp = T.hp;
+    this.tier = tier; this.speed = T.speed * (T.boss ? 1 : 1 + Math.min(0.5, (G ? G.lv.level : 1) * 0.03));
+    this.size = T.size; this.color = T.color; this.T = T;
+  }
+  // Host only: movement + attacks
+  think(g, targets, dt) {
+    this.ox = this.pos.x; this.oy = this.pos.y;
+    let best = null, bd = Infinity;
+    for (const t of targets) { const d = Math.hypot(t.x - this.pos.x, t.y - this.pos.y); if (d < bd) { bd = d; best = t; } }
+    const T = this.T, x = this.pos.x, y = this.pos.y, sp = this.speed, lvl = Math.max(1, Math.round(g.lv.level / 5));
+    let dx = 0, dy = 0;
+    if (!best) {
+      this.wt -= dt;
+      if (this.wt <= 0) { this.wt = rand(0.5, 1.5); this.wa = this.la + rand(-0.8, 0.8); }
+      dx = Math.cos(this.wa) * sp * 0.4; dy = Math.sin(this.wa) * sp * 0.4;
+    } else if (bd > 0) {
+      const dux = (best.x - x) / bd, duy = (best.y - y) / bd, aim = Math.atan2(duy, dux);
+      if (!this.nav || (g.frame + this.id) % 4 === 0) this.nav = navDir(g, this, best, bd);
+      const [ux, uy] = this.nav;
+      if (T.shooter) { // keep distance, strafe, fire single shots
+        if (bd > 380) { dx = ux * sp; dy = uy * sp; } else if (bd < 260) { dx = -dux * sp; dy = -duy * sp; } else { dx = -duy * sp * 0.6; dy = dux * sp * 0.6; }
+        this.cd -= dt;
+        if (this.cd <= 0 && bd < 650) { this.cd = rand(1.3, 2); const spread = g.lv.level >= 8; fire(g, x, y, aim, 7, spread ? 3 : 1, spread ? 0.35 : 0, this.tier); }
+      } else if (T.boss) {
+        // Phases: below 50% hp the boss enrages, below 20% it goes berserk
+        const frac = this.hp / Math.max(1, g.lv.bossMax || this.maxHp);
+        const phase = frac < 0.2 ? 2 : frac < 0.5 ? 1 : 0;
+        if (phase > this.phase) { this.phase = phase; bossRage(g, this); }
+        const q = [1, 0.6, 0.42][this.phase], spd = sp * [1, 1.3, 1.6][this.phase];
+        if (this.tier === 9) { // Sentinel: dense rings, spiral arms when enraged
+          dx = ux * spd; dy = uy * spd;
+          this.cd -= dt;
+          if (this.cd <= 0) {
+            this.cd = 2 * q; this.burst++;
+            const n = 16 + 3 * lvl, a0 = rand(0, TAU);
+            fire(g, x, y, a0, 5, n, TAU, 9);
+            if (this.burst % 2 === 0) fire(g, x, y, a0 + Math.PI / n, 3.4, n, TAU, 9);
+          }
+          if (this.phase > 0) {
+            this.cd2 -= dt;
+            if (this.cd2 <= 0) { this.cd2 = 0.13; this.spin += 0.35; fire(g, x, y, this.spin, 5.5, 2 + this.phase, TAU, 9); }
+          }
+        } else if (this.tier === 10) { // Hydra: shielded while 2+ of its heads are alive
+          dx = ux * spd; dy = uy * spd;
+          let heads = 0;
+          for (const m of g.enemies.values()) if (m.owner === this.id) heads++;
+          this.shield = heads >= 2;
+          this.cd -= dt;
+          if (this.cd <= 0) {
+            this.cd = 1.3 * q;
+            fire(g, x, y, aim, 6.5, 5 + lvl, 1.0, 10);
+            if (this.phase > 0) fire(g, x, y, aim, 4.5, 4 + lvl, 1.6, 10);
+          }
+          this.cd2 -= dt;
+          if (this.cd2 <= 0) {
+            this.cd2 = 7 * q;
+            for (let i = 0; i < 3 + lvl; i++) {
+              const a = rand(0, TAU), m = spawnEnemy(g, lvl >= 2 && i % 2 ? 2 : 1, x + Math.cos(a) * 90, y + Math.sin(a) * 90);
+              if (m) m.owner = this.id;
+            }
+          }
+        } else { // Overseer: winds up and charges, chains charges when enraged
+          if (this.charge > 0) {
+            const cs = 13 + this.phase * 2;
+            this.charge -= dt; dx = this.cx * cs; dy = this.cy * cs;
+            this.cd2 -= dt;
+            if (this.cd2 <= 0) { this.cd2 = 0.08; fire(g, x, y, Math.atan2(this.cy, this.cx), 3, 2, Math.PI, 11); }
+            if (this.charge <= 0) {
+              fire(g, x, y, rand(0, TAU), 5, 12 + 3 * lvl, TAU, 11);
+              if (this.chain > 0) { this.chain--; this.wind = 0.35; }
+            }
+          } else if (this.wind > 0) {
+            this.wind -= dt; this.windup = true;
+            if (this.wind <= 0) { this.windup = false; this.charge = 0.55; this.cx = dux; this.cy = duy; }
+          } else {
+            dx = ux * spd; dy = uy * spd;
+            this.cd -= dt;
+            if (this.cd <= 0) { this.cd = 3 * q; this.wind = 0.6 - this.phase * 0.12; this.chain = this.phase; }
+          }
+        }
+      } else if (T.kamikaze) { // rushes you, arms when close, then explodes
+        if (this.fuse > 0) {
+          this.fuse -= dt; this.windup = true; dx = ux * sp * 0.25; dy = uy * sp * 0.25;
+          if (this.fuse <= 0) { explode(g, this); return bd; }
+        } else { dx = ux * sp; dy = uy * sp; if (bd < 95) this.fuse = 0.7; }
+      } else if (T.dasher) { // creeps closer, flashes, then lunges in a straight line
+        if (this.charge > 0) {
+          this.charge -= dt; dx = this.cx * 15; dy = this.cy * 15;
+          if (this.charge <= 0) this.cd = rand(1.2, 1.8);
+        } else if (this.wind > 0) {
+          this.wind -= dt; this.windup = true;
+          if (this.wind <= 0) { this.windup = false; this.charge = 0.32; this.cx = dux; this.cy = duy; }
+        } else {
+          const close = bd < 300; dx = ux * sp * (close ? 0.5 : 1); dy = uy * sp * (close ? 0.5 : 1);
+          this.cd -= dt;
+          if (this.cd <= 0 && bd < 320 && clearLine(x, y, best.x, best.y)) this.wind = 0.5;
+        }
+      } else { dx = ux * sp; dy = uy * sp; }
+    }
+    // Still stuck on a corner? Side-step for a moment.
+    if (this.detour > 0 && !this.charge) { this.detour -= dt; const sp2 = Math.hypot(dx, dy); if (sp2) { dx = this.dtx * sp2; dy = this.dty * sp2; } }
+    if (dx || dy) {
+      const bx = this.pos.x, by = this.pos.y, want = Math.hypot(dx, dy), walls = getWalls(this.pos);
+      moveBox(this.pos, this.size, dx, dy, walls);
+      // Blocked on one axis? Slide along the wall at full speed instead of crawling
+      const mx = this.pos.x - bx, my = this.pos.y - by;
+      if (Math.abs(mx) < Math.abs(dx) * 0.3 && Math.abs(dy) > 0.05) moveBox(this.pos, this.size, 0, Math.sign(dy) * (want - Math.abs(my)), walls);
+      else if (Math.abs(my) < Math.abs(dy) * 0.3 && Math.abs(dx) > 0.05) moveBox(this.pos, this.size, Math.sign(dx) * (want - Math.abs(mx)), 0, walls);
+      const moved = Math.hypot(this.pos.x - bx, this.pos.y - by);
+      if (want > 0.3 && moved < want * 0.35) this.stuck += dt; else this.stuck = Math.max(0, this.stuck - dt * 0.5);
+      if (this.stuck > 0.3 && this.detour <= 0) {
+        const side = Math.random() < 0.5 ? 1 : -1;
+        this.dtx = -dy / want * side; this.dty = dx / want * side; this.detour = 0.45; this.stuck = 0;
+      }
+      this.la = Math.atan2(dy, dx);
+    }
+    this.t.set(this.pos.x, this.pos.y);
+    return bd;
+  }
+  follow(now, delay) { this.ox = this.pos.x; this.oy = this.pos.y; this.track.sample(now - delay, this.pos); }
+  get flags() { return (this.shield ? 1 : 0) | (this.windup ? 2 : 0) | (this.phase === 1 ? 4 : 0) | (this.phase === 2 ? 8 : 0) | (this.elite ? 16 : 0); }
+  hits(p) { return Math.abs(p.x - this.pos.x) < this.size && Math.abs(p.y - this.pos.y) < this.size; }
+  draw(cam) {
+    if (this.elite && !this.eliteDraw) { // gold glow + pulsing ring around elites
+      this.eliteDraw = true;
+      ctx.save(); ctx.shadowColor = rgb(C.gold); ctx.shadowBlur = 14;
+      this.draw(cam);
+      ctx.strokeStyle = rgb(C.gold, 0.55 + 0.3 * Math.sin(anim * 6)); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(lerpX(this) - cam.x, lerpY(this) - cam.y, this.size + 9, 0, TAU); ctx.stroke();
+      ctx.restore();
+      this.eliteDraw = false;
+      return;
+    }
+    const x = lerpX(this) - cam.x, y = lerpY(this) - cam.y, s = this.size;
+    const col = this.flash > 0 ? "#fff" : rgb(this.color);
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    if (this.T.boss) {
+      const spin = 1 + this.phase * 1.5;
+      if (this.windup) ctx.strokeStyle = Math.floor(anim * 8) % 2 ? "#fff" : col;
+      ctx.save(); ctx.shadowColor = this.phase ? C.death : rgb(this.color); ctx.shadowBlur = 20 + this.phase * 12;
+      if (this.shield) {
+        ctx.save(); ctx.strokeStyle = rgb([120, 220, 255], 0.5 + 0.3 * Math.sin(anim * 5)); ctx.lineWidth = 3; ctx.setLineDash([10, 8]);
+        ctx.lineDashOffset = -anim * 20; ctx.beginPath(); ctx.arc(x, y, s + 18, 0, TAU); ctx.stroke(); ctx.restore();
+      }
+      ctx.lineWidth = 3; poly(x, y, s, 8, anim * 0.2 * spin); ctx.stroke();
+      ctx.shadowBlur = 0; ctx.lineWidth = 2;
+      poly(x, y, s * 0.62, 4, -anim * 0.6 * spin); ctx.stroke();
+      ctx.fillStyle = rgb(this.color, 0.25); poly(x, y, s * 0.3, 6, anim); ctx.fill();
+      ctx.restore();
+    } else if (this.T.shooter) {
+      poly(x, y, s, 3, anim * 0.8); ctx.stroke();
+      ctx.fillStyle = rgb(this.color, 0.3); ctx.fill();
+    } else if (this.T.kamikaze) { // spiky ball; armed = flashing, swelling, blast radius shown
+      const armed = this.windup, r = s * (armed ? 1.15 + 0.15 * Math.sin(anim * 30) : 1);
+      if (armed) ctx.strokeStyle = Math.floor(anim * 12) % 2 ? "#fff" : col;
+      ctx.beginPath();
+      for (let i = 0; i < 16; i++) { const a = anim * 2 + i * TAU / 16, rr = i % 2 ? r * 0.55 : r; ctx[i ? "lineTo" : "moveTo"](x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+      ctx.closePath(); ctx.stroke();
+      ctx.fillStyle = rgb(this.color, armed ? 0.6 : 0.25); ctx.fill();
+      if (armed) {
+        ctx.save(); ctx.strokeStyle = rgb(this.color, 0.4); ctx.lineWidth = 1.5; ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.arc(x, y, this.T.blast, 0, TAU); ctx.stroke(); ctx.restore();
+      }
+    } else if (this.T.dasher) { // arrowhead pointing where it's going
+      const vx = this.pos.x - this.ox, vy = this.pos.y - this.oy;
+      if (Math.hypot(vx, vy) > 0.3) this.face = Math.atan2(vy, vx);
+      const a = this.face;
+      if (this.windup) { ctx.strokeStyle = Math.floor(anim * 10) % 2 ? "#fff" : col; ctx.lineWidth = 3; }
+      ctx.beginPath();
+      ctx.moveTo(x + Math.cos(a) * s * 1.4, y + Math.sin(a) * s * 1.4);
+      ctx.lineTo(x + Math.cos(a + 2.4) * s, y + Math.sin(a + 2.4) * s);
+      ctx.lineTo(x - Math.cos(a) * s * 0.3, y - Math.sin(a) * s * 0.3);
+      ctx.lineTo(x + Math.cos(a - 2.4) * s, y + Math.sin(a - 2.4) * s);
+      ctx.closePath(); ctx.stroke();
+    } else if (this.T.splitter || this.T.piece) { // hexagon; the big one has a crack across it
+      poly(x, y, s, 6, anim * 0.5); ctx.stroke();
+      if (this.T.splitter) {
+        poly(x, y, s * 0.5, 6, -anim * 0.5); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x - s * 0.9, y + 2); ctx.lineTo(x - s * 0.2, y - 3); ctx.lineTo(x + s * 0.3, y + 3); ctx.lineTo(x + s * 0.9, y - 2); ctx.stroke();
+      }
+    } else {
+      ctx.beginPath(); ctx.moveTo(x, y - s); ctx.lineTo(x + s, y); ctx.lineTo(x, y + s); ctx.lineTo(x - s, y); ctx.closePath(); ctx.stroke();
+    }
+  }
+}
+function poly(x, y, r, n, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) { const a = rot + i * TAU / n; ctx[i ? "lineTo" : "moveTo"](x + Math.cos(a) * r, y + Math.sin(a) * r); }
+  ctx.closePath();
+}
+
+class Remote {
+  constructor(st, color, name) {
+    this.pos = new V(st[0], st[1]); this.t = new V(st[0], st[1]); this.ox = st[0]; this.oy = st[1];
+    this.track = new Track(); this.off = undefined; this.trail = []; this.color = color; this.name = name || "Guest";
+    this.jit = 20; this.delay = DELAY; this.rank = 0;
+    this.apply(st, performance.now());
+  }
+  // Their clock -> our clock. Uses the fastest packet seen, creeping up slowly in case the route gets slower.
+  // Also measures how late packets usually are, so the playback delay fits this player's connection.
+  clock(ts, arrived) {
+    if (!num(ts)) return arrived;
+    const est = arrived - ts;
+    this.off = this.off === undefined ? est : Math.min(est, this.off + 0.3);
+    this.jit = Math.max(est - this.off, this.jit * 0.985);
+    return ts + this.off;
+  }
+  targetDelay() { return Math.max(80, Math.min(350, 1000 / SEND_HZ + this.jit * 1.2 + 20)); }
+  apply(st, t) {
+    this.t.set(st[0], st[1]);
+    const v = num(st[10]) && num(st[11]) ? [st[10] / 10 / (STEP * 1000), st[11] / 10 / (STEP * 1000)] : [null, null];
+    this.track.push(t, st[0], st[1], v[0], v[1]);
+    const fl = st[3] | 0;
+    this.hp = st[2]; this.ghost = !!(fl & 1); this.dash = !!(fl & 2); this.paused = !!(fl & 4);
+    this.invuln = !!(fl & 8); this.away = !!(fl & 16); this.rank = (fl >> 8) & 31; this.chat = !!(fl & 32); this.idle = this.paused || this.chat; this.score = st[4];
+  }
+  update(now) {
+    const want = this.targetDelay(); // move toward it gently: fast when we need more buffer, slow when shrinking
+    this.delay += Math.max(-0.4, Math.min(3, want - this.delay));
+    this.ox = this.pos.x; this.oy = this.pos.y;
+    this.track.sample(now - this.delay, this.pos);
+    if (Math.hypot(this.pos.x - this.ox, this.pos.y - this.oy) > 200) { this.ox = this.pos.x; this.oy = this.pos.y; this.trail = []; }
+    if (Math.hypot(this.pos.x - this.ox, this.pos.y - this.oy) > 0.5) {
+      this.trail.push(new V(this.pos.x, this.pos.y));
+      if (this.trail.length > (this.dash ? 15 : 8)) this.trail.shift();
+    } else if (this.trail.length) this.trail.shift();
+  }
+}
+
+// ---------- Network ----------
+class Net {
+  constructor(room, mode, pw) {
+    this.pw = pw || "";
+    this.room = room; this.inbox = []; this.alive = false; this.lastSend = performance.now();
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    this.ws = new WebSocket(`${proto}://${location.host}/ws?room=${room}${token ? "&t=" + token : ""}${mode === "pvp" || mode === "tdm" ? "&mode=" + mode : ""}${pw ? "&pw=" + encodeURIComponent(pw) : ""}`);
+    this.ws.onmessage = e => {
+      if (e.data === "o") return;
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (Array.isArray(m)) m.at = performance.now();
+      if (m[0] === "hi") {
+        this.id = m[1]; this.color = m[2]; this.mode = m[4] === "pvp" || m[4] === "tdm" ? m[4] : "coop"; this.team = m[6] | 0; this.startLevel = num(m[5]) ? m[5] : 1; this.alive = true;
+        for (const [pid, st, c, n, tm] of m[3]) { const u = ["u", pid, st, c, n, tm | 0]; u.at = m.at; this.inbox.push(u); }
+        this.onReady && this.onReady();
+      } else this.inbox.push(m);
+    };
+    this.ws.onclose = e => { const was = this.alive; this.alive = false; this.onEnd && this.onEnd(was, e.code, e.reason); };
+  }
+  send(d) { if (this.alive && this.ws.readyState === 1) { this.ws.send(JSON.stringify(d)); this.lastSend = performance.now(); } }
+  ping() { if (this.ws.readyState === 1) { this.ws.send("p"); this.lastSend = performance.now(); } }
+  close() { this.onEnd = null; this.alive = false; try { this.ws.close(); } catch {} }
+}
+
+// ---------- State ----------
+let state = "LOADING", status = "", statusErr = false, codeInput = "", net = null, G = null, anim = 0;
+
+// ---------- Profile + leaderboard (saved on the server) ----------
+let token = null, profile = null, nameInput = "", loginInput = "", busy = false;
+let banReason = "";
+let boardTab = "score", boardRows = {}, boardErr = "";
+try { token = localStorage.getItem("nb_token"); } catch {}
+const pendingRoom = (() => { const q = new URLSearchParams(location.search).get("room"); return q && /^[A-Za-z0-9]{4,8}$/.test(q) ? q.toUpperCase() : null; })();
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", body: JSON.stringify(body), keepalive: true } : {});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(d.error || "Server error"), { status: r.status, data: d });
+  return d;
+}
+function saveToken(t) { token = t; try { localStorage.setItem("nb_token", t); } catch {} }
+function setProfile(p) {
+  profile = p;
+  if (p.xp > xp) { xp = p.xp; try { localStorage.setItem("nb_xp", String(xp)); } catch {} } // rank follows your name
+}
+async function boot() {
+  goto("LOADING"); status = ""; statusErr = false;
+  if (!token) { goto("NAME"); return; }
+  try { setProfile((await api("/api/login", { token })).profile); afterLogin(); }
+  catch (e) {
+    if (e.status === 403 && e.message === "banned") { banReason = e.data.reason; goto("BANNED"); }
+    else if (e.status === 404) { token = null; try { localStorage.removeItem("nb_token"); } catch {} goto("NAME"); }
+    else { status = "Can't reach the server."; statusErr = true; }
+  }
+}
+function afterLogin() { goto("MENU"); status = ""; loadRooms(); if (pendingRoom && !G) joinRoom(pendingRoom); }
+async function createName() {
+  const name = nameInput.trim();
+  if (name.length < 3 || busy) return;
+  busy = true; status = "";
+  try {
+    const d = await api("/api/register", { name });
+    saveToken(d.token); setProfile(d.profile); afterLogin(); showToast(`Welcome, ${d.profile.name}`);
+  } catch (e) { status = e.status ? e.message : "Can't reach the server."; statusErr = true; }
+  busy = false;
+}
+async function useCode() {
+  const code = loginInput.trim().toUpperCase();
+  if (code.length < 8 || busy) return;
+  busy = true; status = "";
+  try {
+    const d = await api("/api/login", { token: code });
+    saveToken(code); setProfile(d.profile); afterLogin(); showToast(`Welcome back, ${d.profile.name}`);
+  } catch (e) { status = e.status === 404 ? "That login code doesn't exist" : "Can't reach the server."; statusErr = true; }
+  busy = false;
+}
+// Best score/level/XP are sent when a level is cleared, a boss dies, or you leave
+function submitStats(beacon = false) {
+  if (!token || !G) return;
+  const body = G.pvp ? { token, score: 0, level: 0, xp, pvpKills: G.pvpBase + G.sessionKills }
+    : { token, score: Math.trunc(G.score), level: G.lv.level, xp };
+  if (beacon && navigator.sendBeacon) { navigator.sendBeacon("/api/submit", JSON.stringify(body)); return; }
+  api("/api/submit", body).then(d => setProfile(d.profile)).catch(() => {});
+}
+addEventListener("pagehide", () => submitStats(true));
+async function openBoard(tab = boardTab) {
+  if (state !== "BOARD") goto("BOARD");
+  boardTab = tab; boardErr = "";
+  if (boardRows[tab] && performance.now() - boardRows[tab].t < 30000) return; // cached for 30s
+  try { boardRows[tab] = { rows: (await api(`/api/top?by=${tab}`)).rows, t: performance.now() }; }
+  catch { boardErr = "Couldn't load the leaderboard."; }
+}
+function copyLoginCode() {
+  if (!token) return;
+  if (navigator.clipboard) navigator.clipboard.writeText(token).then(() => showToast("Login code copied. Keep it secret!"), () => showToast(token));
+  else showToast(token);
+}
+addEventListener("paste", e => {
+  const t = (e.clipboardData && e.clipboardData.getData("text")) || "";
+  if (state === "CODE") loginInput = t.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 20);
+  else if (state === "NAME") nameInput = (nameInput + t.replace(/[^A-Za-z0-9 _-]/g, "")).slice(0, 16);
+  else if (state === "JOIN") codeInput = t.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 8);
+  else if (state === "PASS") passInput = (passInput + t.replace(/\s/g, "")).slice(0, 20);
+  else if (state === "HOST" && hostPrivate) hostPass = (hostPass + t.replace(/\s/g, "")).slice(0, 20);
+  else if (state === "PLAY" && G && G.chatting) G.chatInput = (G.chatInput + t.replace(/[\r\n]+/g, " ")).slice(0, 100);
+});
+let toast = 0, toastText = "";
+
+function newGame() {
+  for (const m of net.inbox) m.quiet = true;
+  const mates = net.inbox.filter(m => m[0] === "u" && Array.isArray(m[2]) && !(m[2][3] & 1)).map(m => m[2]);
+  const pvp = net.mode !== "coop", tdm = net.mode === "tdm";
+  const pos = pvp ? pvpSpawn(mates, tdm ? net.team : -1) : teamSpawn(mates);
+  return {
+    pos, hp: 100, score: 0, cam: new V(pos.x - W / 2, pos.y - H / 2), shake: 0,
+    trail: [], bullets: [], eshots: [], enemies: new Map(), particles: [], walls: getWalls(pos),
+    shotCd: 0, dashCd: 0, dashT: 0, dashDir: new V(), ghost: false, respawn: 0, invuln: 60, paused: false, away: false,
+    others: new Map(), sendT: 1, lastSent: null, shots: [], hits: new Map(), kills: [], events: [],
+    frame: 0, nextEid: 1, wasHost: false, color: tdm ? TEAM_COLORS[net.team] : pal(net.color), tdm, team: net.team,
+    up: { rate: 0, dmg: 0, multi: 0, speed: 0, hull: 0, regen: 0, dash: 0, nade: 0, fuse: 0, blast: 0 }, healFx: 0, picks: 0, offer: null,
+    lv: { level: 1, phase: 0, timer: 4, toSpawn: 0, spawnT: 0, remaining: 0, bossMax: 0 }, lvInit: false,
+    pvp, deaths: new Map(), pvpOut: [], killedBy: null, sessionKills: 0, pvpBase: profile ? profile.pvpKills || 0 : 0,
+    round: { over: false, timer: 0, grace: 0, winner: "" },
+    worldDelay: DELAY, vel: new V(), god: false, cmdOut: null, rings: [], sKills: 0, dashes: 0, streak: 0, aliveT: 0, lastHp: 100, hurtLevel: 0, nadeId: 0, nadeTouch: new Map(), nadeKills: new Map(), banners: [], chat: [], chatting: false, chatInput: "", chatOut: null, nadeCd: 0, pendingShots: [], pendingEvents: [], opos: new V(pos.x, pos.y), ocam: new V(pos.x - W / 2, pos.y - H / 2), shx: 0, shy: 0,
+  };
+}
+function setUrl(room) { history.replaceState(null, "", room ? `?room=${room}` : location.pathname); }
+function showToast(t) { toastText = t; toast = 2; }
+function banner(title, sub = "", color = C.accent, dur = 2.6) {
+  if (!G) return;
+  if (G.banners.length) { G.banners[0].t = Math.min(G.banners[0].t, 0.35); G.banners.length = 1; } // newest wins
+  G.banners.push({ title, sub, color, t: dur, dur });
+}
+function goto(s) { state = s; sel = 0; }
+
+function connect(room, mode, pw) {
+  if (net) net.close();
+  status = "Connecting"; statusErr = false;
+  const n = new Net(room, mode, pw);
+  net = n;
+  n.onReady = () => { arena = n.mode !== "coop"; G = newGame(); goto("PLAY"); status = ""; setUrl(room); if (G.pvp) pvpStart(G); };
+  n.onEnd = (was, code, reason) => {
+    submitStats();
+    net = null; G = null; goto("MENU"); statusErr = true; setUrl(null);
+    if (code === 4003) { banReason = reason || "Banned by an admin"; goto("BANNED"); return; }
+    status = code === 4001 ? `You were kicked by an admin${reason ? ": " + reason : ""}. You can rejoin in a minute.`
+      : code === 4000 ? "You joined this room again from another tab or device."
+      : was ? "Lost connection to the room." : "Couldn't join. The room may be full (8 max), the password was wrong, you were just kicked, or the server is offline.";
+  };
+}
+const newCode = () => Array.from({ length: 5 }, () => ROOM_CHARS[Math.random() * ROOM_CHARS.length | 0]).join("");
+let hostMode = "coop", hostPrivate = false, hostPass = "", passTarget = "", passInput = "";
+const openHost = mode => { hostMode = mode; hostPrivate = false; hostPass = ""; status = ""; goto("HOST"); };
+const host = () => openHost("coop");
+const hostPvp = () => openHost("pvp");
+function createRoom() {
+  if (hostPrivate && hostPass.length < 3) return;
+  goto("MENU"); connect(newCode(), hostMode, hostPrivate ? hostPass : "");
+}
+const playMain = () => { goto("MENU"); connect("MAIN"); };
+// Joining: ask the room first, so private rooms can ask for the password
+async function joinRoom(code) {
+  if (code === "MAIN") return playMain();
+  goto("MENU"); status = "Checking room"; statusErr = false;
+  try {
+    const r = await api(`/api/check?room=${code}`);
+    if (r.exists && r.private) { passTarget = code; passInput = ""; status = ""; goto("PASS"); return; }
+  } catch {}
+  status = "";
+  connect(code);
+}
+async function submitPass() {
+  if (!passInput || busy) return;
+  busy = true; status = "";
+  try {
+    const r = await api(`/api/check?room=${passTarget}&pw=${encodeURIComponent(passInput)}`);
+    if (!r.exists || r.ok) { goto("MENU"); connect(passTarget, undefined, passInput); }
+    else { status = "Wrong password"; statusErr = true; }
+  } catch { status = "Can't reach the server."; statusErr = true; }
+  busy = false;
+}
+let rooms = null, roomsAt = -1e9, roomsBusy = false, roomsErr = "";
+async function loadRooms() {
+  if (roomsBusy) return;
+  roomsBusy = true; roomsAt = performance.now();
+  try { rooms = (await api("/api/rooms")).rooms; roomsErr = ""; } catch { roomsErr = "Couldn't load rooms"; }
+  roomsBusy = false;
+}
+const openJoin = () => { goto("JOIN"); codeInput = ""; status = ""; loadRooms(); };
+const submitJoin = () => { if (codeInput.length >= 4) joinRoom(codeInput); };
+const pause = () => { G.paused = true; mouse.down = false; sel = 0; };
+const resume = () => { G.paused = false; mouse.down = false; };
+function copyInvite() {
+  const link = `${location.origin}${location.pathname}?room=${net.room}`;
+  const msg = net.pw ? "Invite link copied. They'll need the password too" : "Invite link copied";
+  if (navigator.clipboard) navigator.clipboard.writeText(link).then(() => showToast(msg), () => showToast(link));
+  else showToast(link);
+}
+function leave() { submitStats(); if (net) net.close(); net = null; G = null; goto("MENU"); status = ""; setUrl(null); }
+
+// ---------- Upgrades ----------
+function rollOffer(g) {
+  const open = UPGRADES.filter(u => g.up[u.k] < u.max);
+  for (let i = open.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [open[i], open[j]] = [open[j], open[i]]; }
+  g.offer = open.slice(0, 3);
+  if (!g.offer.length) { g.offer = null; g.picks = 0; }
+}
+function takeUpgrade(g, u) {
+  g.up[u.k]++;
+  if (g.up[u.k] >= u.max) unlock("fully_loaded");
+  if (u.k === "hull") g.hp = maxHp(g);
+  g.picks--; g.offer = null;
+  if (g.picks > 0) rollOffer(g);
+}
+function pickUpgrade(i) {
+  const g = G;
+  if (!g || !g.offer || !g.offer[i]) return;
+  const u = g.offer[i];
+  takeUpgrade(g, u);
+  showToast(`${u.name} ${"I".repeat(g.up[u.k])}`);
+}
+
+function onKey(e) {
+  const nav = d => { usingMouse = false; if (buttons.length) sel = (sel + d + buttons.length) % buttons.length; };
+  const activate = () => { const b = buttons[sel]; if (b && !b.disabled) b.action(); };
+
+  if (state === "ACH") { if (e.code === "Escape" || e.code === "Enter") goto("MENU"); return; }
+  if (state === "BANNED") return;
+  if (state === "HOST") {
+    if (e.code === "Escape") goto("MENU");
+    else if (e.code === "Tab") hostPrivate = !hostPrivate;
+    else if ((e.code === "ArrowLeft" || e.code === "ArrowRight") && hostMode !== "coop") hostMode = hostMode === "pvp" ? "tdm" : "pvp";
+    else if (e.code === "Enter") createRoom();
+    else if (hostPrivate && e.code === "Backspace") hostPass = hostPass.slice(0, -1);
+    else if (hostPrivate && e.key.length === 1 && e.key !== " " && hostPass.length < 20) hostPass += e.key;
+    return;
+  }
+  if (state === "PASS") {
+    if (e.code === "Escape") { status = ""; openJoin(); }
+    else if (e.code === "Backspace") passInput = passInput.slice(0, -1);
+    else if (e.code === "Enter") submitPass();
+    else if (e.key.length === 1 && e.key !== " " && passInput.length < 20) passInput += e.key;
+    return;
+  }
+  if (state === "LOADING") {
+    if (e.code === "Enter" && statusErr) boot();
+  } else if (state === "NAME") {
+    if (e.code === "Backspace") nameInput = nameInput.slice(0, -1);
+    else if (e.code === "Enter") createName();
+    else if (e.code === "Tab") { goto("CODE"); loginInput = ""; status = ""; }
+    else if (/^[A-Za-z0-9 _-]$/.test(e.key) && nameInput.length < 16 && !(e.key === " " && (!nameInput || nameInput.endsWith(" ")))) nameInput += e.key;
+  } else if (state === "CODE") {
+    if (e.code === "Escape") { goto("NAME"); status = ""; }
+    else if (e.code === "Backspace") loginInput = loginInput.slice(0, -1);
+    else if (e.code === "Enter") useCode();
+    else if (/^[a-z0-9]$/i.test(e.key) && loginInput.length < 20) loginInput += e.key.toUpperCase();
+  } else if (state === "BOARD") {
+    const tabs = ["score", "level", "pvp", "xp"], i = tabs.indexOf(boardTab);
+    if (e.code === "Escape") goto("MENU");
+    else if (e.code === "ArrowLeft") openBoard(tabs[(i + 3) % 4]);
+    else if (e.code === "ArrowRight") openBoard(tabs[(i + 1) % 4]);
+    else if (["Digit1", "Digit2", "Digit3", "Digit4"].includes(e.code)) openBoard(tabs[+e.code.slice(5) - 1]);
+    else if (e.code === "Enter" || e.code === "Space") activate();
+    else if (e.code === "ArrowUp") nav(-1);
+    else if (e.code === "ArrowDown") nav(1);
+  } else if (state === "MENU") {
+    if (net) return;
+    if (e.code === "KeyH") host();
+    else if (e.code === "KeyP") hostPvp();
+    else if (e.code === "KeyM") playMain();
+    else if (e.code === "KeyA") goto("ACH");
+    else if (e.code === "KeyJ") openJoin();
+    else if (e.code === "KeyL") openBoard();
+    else if (e.code === "KeyK") copyLoginCode();
+    else if (e.code === "ArrowUp" || e.code === "KeyW") nav(-1);
+    else if (e.code === "ArrowDown" || e.code === "KeyS") nav(1);
+    else if (e.code === "Enter" || e.code === "Space") activate();
+  } else if (state === "JOIN") {
+    if (e.code === "Escape") goto("MENU");
+    else if (e.code === "Backspace") codeInput = codeInput.slice(0, -1);
+    else if (e.code === "ArrowUp") nav(-1);
+    else if (e.code === "ArrowDown") nav(1);
+    else if (e.code === "Enter") { if (codeInput.length >= 4) submitJoin(); else activate(); }
+    else if (/^[a-z0-9]$/i.test(e.key) && codeInput.length < 8) codeInput += e.key.toUpperCase();
+  } else if (state === "PLAY") {
+    if (G.chatting) {
+      if (e.code === "Escape") closeChat();
+      else if (e.code === "Enter") sendChat();
+      else if (e.code === "Backspace") G.chatInput = G.chatInput.slice(0, -1);
+      else if (e.key.length === 1 && G.chatInput.length < 100) G.chatInput += e.key;
+      return;
+    }
+    if (G.paused) {
+      if (e.code === "Escape") resume();
+      else if (e.code === "KeyC") copyInvite();
+      else if (e.code === "ArrowUp" || e.code === "KeyW") nav(-1);
+      else if (e.code === "ArrowDown" || e.code === "KeyS") nav(1);
+      else if (e.code === "Enter" || e.code === "Space") activate();
+    } else if (e.code === "Escape") pause();
+    else if (e.code === "KeyT" || e.code === "Enter") openChat();
+    else if (e.code === "KeyC") copyInvite();
+    else if (["Digit1", "Digit2", "Digit3"].includes(e.code) && showCards(G)) pickUpgrade(+e.code.slice(5) - 1);
+  }
+}
+function openChat() { const g = G; g.chatting = true; g.chatInput = ""; keys.clear(); mouse.down = false; sendState(g, true); }
+function closeChat() { const g = G; g.chatting = false; keys.clear(); sendState(g, true); }
+function sendChat() {
+  const g = G, t = g.chatInput.trim().slice(0, 100);
+  if (t.startsWith("/")) runCommand(g, t);
+  else if (t) { g.chatOut = t; addChat(g, profile ? profile.name : "You", g.color, t); unlock("social"); }
+  closeChat();
+}
+// ---------- Achievements (saved to your account; each one gives bonus XP) ----------
+const ACH = [
+  ["first_blood", "First Blood", "Kill your first enemy", 100],
+  ["century", "Century", "Kill 100 enemies in one game", 500],
+  ["exterminator", "Exterminator", "Kill 1,000 enemies in total", 2000],
+  ["clear5", "Warming Up", "Clear level 5", 300],
+  ["clear10", "Deep Breach", "Clear level 10", 1000],
+  ["clear20", "No Way Out", "Clear level 20", 4000],
+  ["clear30", "Into the Void", "Clear level 30", 10000],
+  ["boss_slayer", "Boss Slayer", "Land the final hit on a boss", 1000],
+  ["full_set", "Full Set", "Defeat the Sentinel, Hydra and Overseer", 3000],
+  ["untouchable", "Untouchable", "Clear a boss level without taking damage", 5000],
+  ["grenadier", "Grenadier", "Kill 5 enemies with one grenade", 800],
+  ["too_slow", "Too Slow", "Kill 25 kamikazes before they explode", 800],
+  ["divide", "Divide and Conquer", "Kill 50 splitter pieces", 600],
+  ["survivor", "Survivor", "Stay alive for 5 minutes in co-op", 1500],
+  ["close_call", "Close Call", "Survive a hit with 5 hull or less", 400],
+  ["squad", "Squad Goals", "Clear a level with 4 or more players", 800],
+  ["main_room", "Main Character", "Clear a level in the main room", 500],
+  ["six_figures", "Six Figures", "Score 100,000 in one co-op game", 3000],
+  ["fully_loaded", "Fully Loaded", "Max out any upgrade", 400],
+  ["blink", "Blink", "Dash 100 times in one game", 300],
+  ["gladiator", "Gladiator", "Get your first PvP elimination", 200],
+  ["on_fire", "On Fire", "Get 5 PvP eliminations without dying", 1000],
+  ["unstoppable", "Unstoppable", "Get 10 PvP eliminations without dying", 3000],
+  ["champion", "Champion", "Win a free-for-all round", 1500],
+  ["team_player", "Team Player", "Win a team deathmatch round", 1000],
+  ["social", "Social", "Send a chat message", 50],
+];
+const hasAch = id => !!(profile && (profile.ach || []).includes(id));
+function unlock(id) {
+  if (!profile || hasAch(id)) return;
+  const a = ACH.find(x => x[0] === id);
+  if (!a) return;
+  (profile.ach = profile.ach || []).push(id);
+  addXp(a[3]);
+  banner(`Achievement: ${a[1]}`, `${a[2]}   +${a[3].toLocaleString()} XP`, C.gold, 3.5);
+  api("/api/ach", { token, id }).catch(() => {});
+  submitStats();
+}
+// Lifetime counters for achievements, kept in this browser
+function lifeStats() {
+  if (!profile) return {};
+  try { return JSON.parse(localStorage.getItem("nb_life_" + profile.name) || "{}"); } catch { return {}; }
+}
+function bumpLife(key, n = 1) {
+  const st = lifeStats(); st[key] = (st[key] || 0) + n;
+  try { localStorage.setItem("nb_life_" + profile.name, JSON.stringify(st)); } catch {}
+  return st[key];
+}
+function addLifeSet(key, v) {
+  const st = lifeStats(), set = new Set(st[key] || []); set.add(v); st[key] = [...set];
+  try { localStorage.setItem("nb_life_" + profile.name, JSON.stringify(st)); } catch {}
+  return set.size;
+}
+
+// ---------- Admin commands ----------
+// Type them in chat. Only accounts listed in ADMINS (wrangler.toml) can use them; the server blocks everyone else.
+const COMMANDS = {
+  help: "/help  list commands",
+  rank: "/rank <1-30 or rank name> [player]  set a rank",
+  xp: "/xp <amount>  add XP",
+  god: "/god  toggle invincibility",
+  heal: "/heal  full hull (revives you too)",
+  nade: "/nade  recharge grenade and dash",
+  upgrades: "/upgrades  max every upgrade",
+  killboss: "/killboss  destroy the boss",
+  killall: "/killall  destroy every enemy",
+  skip: "/skip  clear the current level",
+  level: "/level <n>  jump to a level",
+  boss: "/boss  spawn a boss",
+  spawn: "/spawn <1-8> [count]  spawn enemies (5 kamikaze, 6 dasher, 7 splitter)",
+};
+const MOD_HELP = {
+  players: "/players  list everyone in this room",
+  kick: "/kick <player> [reason]  remove them from their room (they can rejoin after 1 minute)",
+  ban: "/ban <player> [reason]  ban their account from the game",
+  ipban: "/ipban <player> [reason]  ban their account AND their internet connection",
+  unban: "/unban <player>  lift a ban (and IP ban)",
+  mute: "/mute <player>  stop their chat messages",
+  unmute: "/unmute <player>  let them chat again",
+  bans: "/bans  list banned players",
+  announce: "/announce <message>  banner in every room that has players",
+};
+Object.assign(COMMANDS, MOD_HELP);
+const WORLD_CMDS = new Set(["killboss", "killall", "skip", "level", "boss", "spawn"]);
+// Names can have spaces: use "quotes", or it matches the longest name of someone in the room
+function parseTarget(g, args) {
+  const line = args.join(" ");
+  const q = line.match(/^"([^"]+)"\s*(.*)$/);
+  if (q) return [q[1], q[2]];
+  const names = g ? [...g.others.values()].map(o => o.name) : [];
+  for (let k = args.length; k > 0; k--) {
+    const cand = args.slice(0, k).join(" ").toLowerCase(), hit = names.find(n => n.toLowerCase() === cand);
+    if (hit) return [hit, args.slice(k).join(" ")];
+  }
+  return [null, null, line]; // not in this room: let the server work out where the name ends
+}
+async function modCommand(g, cmd, args) {
+  if (cmd === "players") {
+    sys(g, `In this room: ${[profile.name, ...[...g.others.values()].map(o => o.name)].join(", ")}`);
+    return;
+  }
+  if (cmd === "bans") {
+    try {
+      const r = await api("/api/admin/mod", { token, action: "bans" });
+      if (!r.bans.length) return sys(g, "Nobody is banned");
+      for (const [n, why, ip] of r.bans) sys(g, `${n}${ip ? " (IP)" : ""}: ${why}`);
+    } catch (e) { sys(g, e.message); }
+    return;
+  }
+  if (cmd === "announce") {
+    const text = args.join(" ").trim();
+    if (!text) return sys(g, "Usage: " + MOD_HELP.announce);
+    try { const r = await api("/api/admin/mod", { token, action: "announce", reason: text }); sys(g, `Announced in ${r.rooms} room${r.rooms === 1 ? "" : "s"}`); }
+    catch (e) { sys(g, e.message); }
+    return;
+  }
+  const [target, reason, raw] = parseTarget(g, args);
+  if (!target && !raw) return sys(g, "Usage: " + MOD_HELP[cmd]);
+  try {
+    const r = await api("/api/admin/mod", raw ? { token, action: cmd, raw } : { token, action: cmd, target, reason });
+    const done = { kick: "kicked", ban: "banned", ipban: "banned (account and IP)", unban: "unbanned", mute: "muted", unmute: "unmuted" }[cmd];
+    sys(g, `${r.name} ${done}${cmd === "kick" && !r.online ? " (they weren't in a room)" : ""}${r.ipMissing ? ". No IP on record yet, so only the account is banned" : ""}`);
+  } catch (e) { sys(g, e.message); }
+}
+const sys = (g, t) => addChat(g, "System", C.gold, t, true);
+async function runCommand(g, line) {
+  const [c0, ...args] = line.slice(1).trim().split(/\s+/), cmd = (c0 || "").toLowerCase();
+  if (!profile || !profile.admin) return sys(g, "Commands are for admins only.");
+  if (!COMMANDS[cmd]) return sys(g, `Unknown command /${cmd}. Type /help`);
+  switch (cmd) {
+    case "help": for (const k in COMMANDS) sys(g, COMMANDS[k]); return;
+    case "god": g.god = !g.god; return sys(g, g.god ? "God mode on" : "God mode off");
+    case "heal":
+      if (g.ghost) { g.ghost = false; g.invuln = 60; g.opos.set(g.pos.x, g.pos.y); }
+      g.hp = maxHp(g); return sys(g, "Hull repaired");
+    case "nade": g.nadeCd = 0; g.dashCd = 0; return sys(g, "Grenade and dash recharged");
+    case "upgrades":
+      for (const u of UPGRADES) g.up[u.k] = u.max;
+      g.hp = maxHp(g); g.picks = 0; g.offer = null; return sys(g, "Every upgrade maxed");
+    case "xp": {
+      const n = Math.max(0, Math.min(1e7, parseInt(args[0], 10) || 0));
+      addXp(n); submitStats(); return sys(g, `+${n.toLocaleString()} XP`);
+    }
+    case "rank": {
+      const all = args.join(" ").toLowerCase();
+      let r = RANKS.findIndex(n => n.toLowerCase() === all), target = null;
+      if (r < 0) { r = (parseInt(args[0], 10) || 0) - 1; target = args.slice(1).join(" ") || null; }
+      if (r < 0 || r >= RANKS.length) return sys(g, `Use a number from 1 to ${RANKS.length} or a rank name`);
+      try {
+        const res = await api("/api/admin/xp", { token, target, xp: RANK_XP[r] });
+        if (!target || res.name === profile.name) {
+          xp = RANK_XP[r]; profile.xp = xp;
+          try { localStorage.setItem("nb_xp", String(xp)); } catch {}
+          sendState(g, true);
+        }
+        return sys(g, `${res.name} is now ${RANKS[r]}${target ? " (they'll see it next time they log in)" : ""}`);
+      } catch (e) { return sys(g, e.message || "Couldn't set the rank"); }
+    }
+  }
+  if (MOD_HELP[cmd]) return modCommand(g, cmd, args);
+  if (WORLD_CMDS.has(cmd)) {
+    if (g.pvp) return sys(g, "That command only works in co-op");
+    if (hostId(g) === net.id) sys(g, runWorld(g, cmd, args, net.id));
+    else { g.cmdOut = [cmd, ...args].join(" "); sys(g, `/${cmd} sent to the host`); }
+  }
+}
+// Host only: commands that change the shared world
+function runWorld(g, cmd, args, from) {
+  const L = g.lv, who = from === net.id ? g.pos : (g.others.get(from) || {}).t || g.pos;
+  switch (cmd) {
+    case "killboss": {
+      let n = 0;
+      for (const e of [...g.enemies.values()]) if (e.T.boss) { killEnemy(g, e, from); n++; }
+      return n ? "Boss destroyed" : "There's no boss right now";
+    }
+    case "killall": case "skip":
+      for (const e of [...g.enemies.values()]) killEnemy(g, e, from);
+      if (cmd === "skip") { if (L.phase === 1) L.toSpawn = 0; else L.timer = 0.1; return "Level skipped"; }
+      return "All enemies destroyed";
+    case "level": {
+      const n = Math.max(1, Math.min(999, parseInt(args[0], 10) || 1));
+      g.enemies.clear(); g.eshots = [];
+      L.level = n; L.phase = 0; L.timer = 3; L.toSpawn = 0; L.bossMax = 0;
+      return `Jumping to level ${n}`;
+    }
+    case "boss": {
+      const bossNo = Math.max(1, Math.round(L.level / 5)), n = 1 + g.others.size, a = rand(0, TAU);
+      const hp = Math.round(2400 * Math.pow(bossNo, 1.6) * (1 + 0.75 * (n - 1)));
+      const e = spawnEnemy(g, 9 + ((bossNo - 1) % 3), who.x + Math.cos(a) * 500, who.y + Math.sin(a) * 500, hp);
+      if (!e) return "Too many enemies to spawn a boss";
+      L.bossMax = hp; return `${e.T.boss} spawned`;
+    }
+    case "spawn": {
+      const tier = [1, 2, 3, 4, 5, 6, 7, 8].includes(+args[0]) ? +args[0] : 1, n = Math.max(1, Math.min(30, parseInt(args[1], 10) || 5));
+      let made = 0;
+      for (let i = 0; i < n; i++) { const a = rand(0, TAU), r = rand(350, 550); if (spawnEnemy(g, tier, who.x + Math.cos(a) * r, who.y + Math.sin(a) * r)) made++; }
+      return `Spawned ${made} enemies`;
+    }
+  }
+  return "";
+}
+function addChat(g, name, color, text, system = false) {
+  g.chat.push({ name, color, text, system, t: performance.now() });
+  if (g.chat.length > 30) g.chat.shift();
+}
+const showCards = g => g.offer && g.picks > 0 && g.lv.phase === 0 && !g.paused && !g.chatting;
+
+// ---------- Shared-world rules ----------
+// Host = the earliest-joined player whose tab is open. Every client works this out the same way.
+function hostId(g) {
+  let best = g.away ? null : net.id;
+  for (const [id, o] of g.others) if (!o.away && (best === null || id < best)) best = id;
+  return best;
+}
+const tag = id => "#" + id.slice(-4);
+function nameOf(g, id) { return id === net.id ? "You" : (g.others.get(id) || {}).name || "Someone"; }
+const short = (n, k) => n.length > k ? n.slice(0, k - 1) + "…" : n;
+
+function boom(g, e) {
+  const big = e.T.boss;
+  for (let i = 0; i < (big ? 60 : 12); i++) g.particles.push(new Particle(e.pos.x, e.pos.y, e.color, big ? 2 : 1));
+  if (e.pos.dist(g.pos) < 700) g.shake = Math.max(g.shake, big ? 18 : e.tier * 3);
+}
+// Runs on every client (host directly, others from the host's kill list)
+function onKill(g, id, killer, tier) {
+  const e = g.enemies.get(id), T = tierOf(tier);
+  const mult = e && e.elite ? 2 : 1;
+  if (e) { boom(g, e); g.enemies.delete(id); }
+  if (killer === net.id) {
+    g.score += T.pts * mult; addXp(T.xp * mult);
+    g.sKills++; unlock("first_blood");
+    if (g.sKills >= 100) unlock("century");
+    if (bumpLife("kills") >= 1000) unlock("exterminator");
+    if (T.kamikaze && bumpLife("kamikaze") >= 25) unlock("too_slow");
+    if (T.piece && bumpLife("pieces") >= 50) unlock("divide");
+    if (T.boss) { unlock("boss_slayer"); if (addLifeSet("bosses", T.boss) >= 3) unlock("full_set"); }
+    if (g.score >= 100000 && !g.pvp) unlock("six_figures");
+    const nid = g.nadeTouch.get(id);
+    if (nid) { const c = (g.nadeKills.get(nid) || 0) + 1; g.nadeKills.set(nid, c); if (c >= 5) unlock("grenadier"); }
+  }
+  if (T.boss) {
+    addXp(100);
+    submitStats();
+    g.eshots = [];
+    banner(`${T.boss} destroyed`, `${nameOf(g, killer)} landed the final shot`, T.color, 3);
+  }
+}
+function damageEnemy(g, e, dmg, killer) { // host only
+  if (e.shield) dmg *= 0.2;
+  e.hp -= dmg; e.flash = 3;
+  if (e.hp <= 0) killEnemy(g, e, killer);
+}
+function bossRage(g, e) {
+  banner(e.phase === 2 ? `${e.T.boss} is going berserk` : `${e.T.boss} is enraged`, e.phase === 2 ? "Final phase" : "Attacks are faster", [255, 0, 50], 2);
+}
+function killEnemy(g, e, killer) { // host only
+  g.kills.push([e.id, killer, e.tier]);
+  onKill(g, e.id, killer, e.tier);
+  if (e.T.splitter) for (let i = 0; i < 3; i++) { // splits into three fast pieces
+    const a = i * TAU / 3 + rand(0, 1);
+    spawnEnemy(g, 8, e.pos.x + Math.cos(a) * 16, e.pos.y + Math.sin(a) * 16);
+  }
+}
+function explode(g, e) { // host only: kamikaze goes off (nobody gets the kill)
+  g.kills.push([e.id, "", e.tier]);
+  onKill(g, e.id, "", e.tier);
+  blast(g, e.pos.x, e.pos.y, e.T.blast, e.T.blastDmg, e.color);
+  if (g.events.length < MAX_EVENTS) g.events.push([Math.round(e.pos.x), Math.round(e.pos.y), 0, 0, 0, e.T.blast, e.tier, g.frame]);
+}
+// An explosion on every screen; each player only checks whether it hurt themselves
+function blast(g, x, y, r, dmg, color) {
+  g.rings.push({ x, y, r, t: 0 });
+  for (let i = 0; i < 40; i++) g.particles.push(new Particle(x, y, i % 3 ? color : C.white, 2.2));
+  if (Math.hypot(g.pos.x - x, g.pos.y - y) < 700) g.shake = Math.max(g.shake, 14);
+  const idle = g.paused || g.chatting;
+  if (!g.ghost && !idle && !g.god && g.dashT <= 0 && g.invuln <= 0 && Math.hypot(g.pos.x - x, g.pos.y - y) < r + 12) g.hp -= dmg;
+}
+
+// Level transitions: the host triggers these, everyone else sees them from the host's level info
+function onLevelStart(g) {
+  g.eshots = [];
+  const L = g.lv;
+  g.hurtLevel = 0; g.lastHp = g.hp; g.watchLevel = L.level; // saw this level from the start
+  if (L.level % 5 === 0) {
+    const T = TIERS[9 + ((L.level / 5 - 1) % 3)];
+    banner(`Level ${L.level}`, `Boss incoming: ${T.boss}`, T.color, 3);
+  } else {
+    const NEW = { 1: "Clear every enemy to advance", 2: "New enemy: splitters break into three pieces",
+      3: "Elite enemies glow gold: double health, faster, double points",
+      4: "New enemy: dashers flash white, then lunge at you", 6: "New enemy: kamikazes explode next to you. Shoot them first!" };
+    banner(`Level ${L.level}`, NEW[L.level] || "", C.accent);
+  }
+}
+function onLevelClear(g, prev) {
+  g.eshots = [];
+  g.picks++;
+  if (!g.offer) rollOffer(g);
+  addXp(10 * prev);
+  if (prev >= 5) unlock("clear5");
+  if (prev >= 10) unlock("clear10");
+  if (prev >= 20) unlock("clear20");
+  if (prev >= 30) unlock("clear30");
+  if (g.others.size + 1 >= 4) unlock("squad");
+  if (net.room === "MAIN") unlock("main_room");
+  if (prev % 5 === 0 && g.watchLevel === prev && g.hurtLevel !== prev) unlock("untouchable");
+  submitStats();
+  if (g.ghost) { g.ghost = false; g.invuln = 90; g.pos = teamSpawn([...g.others.values()].filter(o => !o.ghost).map(o => [o.t.x, o.t.y])); g.opos.set(g.pos.x, g.pos.y); g.trail = []; }
+  g.hp = maxHp(g);
+  banner(`Level ${prev} cleared`, "Hull repaired, dash and grenade improved. Pick an upgrade: 1, 2 or 3", C.green);
+}
+function onWipe(g) {
+  g.eshots = [];
+  banner("Squad wiped", `Restarting level ${g.lv.level}`, [255, 0, 50], 3);
+}
+
+function grenade(g, x, y, a0, color, remote, dmg, late = 0, owner = null, n = NADE_SHOTS) {
+  for (let i = 0; i < n; i++) {
+    const b = new Bullet(x, y, a0 + i * TAU / n, color, remote, dmg, 70, owner, true);
+    for (let k = 0; k < late; k++) b.update();
+    b.ox = b.pos.x; b.oy = b.pos.y;
+    g.bullets.push(b);
+  }
+  for (let i = 0; i < 30; i++) g.particles.push(new Particle(x, y, i % 2 ? color : C.white, 1.6));
+}
+// ---------- PvP free-for-all ----------
+function pvpSpawn(others, team = -1) { // open spot in the arena, as far from everyone as possible (TDM: on your team's side)
+  let best = null, bestD = -1;
+  for (let i = 0; i < 14; i++) {
+    const sx = team === 0 ? rand(-ARENA + 150, -350) : team === 1 ? rand(350, ARENA - 150) : rand(-ARENA + 150, ARENA - 150);
+    const p = freeSpotNear(sx, rand(-ARENA + 150, ARENA - 150));
+    if (Math.abs(p.x) > ARENA - 30 || Math.abs(p.y) > ARENA - 30) continue;
+    const d = others.length ? Math.min(...others.map(o => Math.hypot(o[0] - p.x, o[1] - p.y))) : 0;
+    if (d > bestD) { bestD = d; best = p; }
+  }
+  return best || new V(0, 0);
+}
+function pvpStart(g) {
+  if (g.tdm) banner(`You're on the ${TEAM_NAMES[g.team]} team`, `Team deathmatch: first team to ${TDM_TO_WIN} eliminations wins`, TEAM_COLORS[g.team], 3.5);
+  else banner("Free for all", `First to ${KILLS_TO_WIN} eliminations wins the round`, [255, 70, 90], 3);
+}
+const teamKills = g => { const k = [0, 0]; k[g.team] += g.score; for (const o of g.others.values()) k[o.team | 0] += o.score; return k; };
+const displayName = (g, id) => id === net.id ? (profile ? profile.name : "You") : (g.others.get(id) || {}).name || "Someone";
+function onPvpKill(g, killer, victim) {
+  g.deaths.set(victim, (g.deaths.get(victim) || 0) + 1);
+  const kc = killer === net.id ? g.color : (g.others.get(killer) || {}).color || C.white;
+  addChat(g, displayName(g, killer), kc, `eliminated ${displayName(g, victim)}`, true);
+  if (killer === net.id && victim !== net.id) {
+    g.score++; g.sessionKills++; addXp(25);
+    g.streak++; unlock("gladiator");
+    if (g.streak >= 5) unlock("on_fire");
+    if (g.streak >= 10) unlock("unstoppable");
+    if (!g.ghost) { g.hp = maxHp(g); g.healFx = 1; } // kill = full heal
+    showToast(`You eliminated ${displayName(g, victim)}`);
+  }
+  if (victim === net.id) { g.killedBy = killer; g.streak = 0; }
+}
+function pvpTick(g, dt) {
+  const R = g.round;
+  if (R.grace > 0) R.grace -= dt;
+  if (R.over) {
+    R.timer -= dt;
+    if (R.timer <= 0) { // new round: everyone resets their own kills
+      R.over = false; R.grace = 3; g.score = 0; g.deaths.clear();
+      g.ghost = false; g.hp = maxHp(g); g.invuln = 120;
+      g.pos = pvpSpawn([...g.others.values()].map(o => [o.t.x, o.t.y]), g.tdm ? g.team : -1); g.opos.set(g.pos.x, g.pos.y); g.trail = [];
+      banner("New round", g.tdm ? `First team to ${TDM_TO_WIN} wins` : `First to ${KILLS_TO_WIN} wins`, [255, 70, 90]);
+    }
+    return;
+  }
+  if (R.grace > 0) return;
+  if (g.tdm) {
+    const k = teamKills(g), w = k[0] >= TDM_TO_WIN ? 0 : k[1] >= TDM_TO_WIN ? 1 : -1;
+    if (w >= 0) {
+      R.over = true; R.timer = 8; R.winner = `${TEAM_NAMES[w]} team`;
+      if (w === g.team) { addXp(150); unlock("team_player"); banner("Your team wins!", "Next round in 8 seconds", C.gold, 4); }
+      else banner(`${TEAM_NAMES[w]} team wins`, "Next round in 8 seconds", TEAM_COLORS[w], 4);
+      submitStats();
+    }
+    return;
+  }
+  let winner = g.score >= KILLS_TO_WIN ? net.id : null;
+  for (const [id, o] of g.others) if (!winner && o.score >= KILLS_TO_WIN) winner = id;
+  if (winner) {
+    R.over = true; R.timer = 8; R.winner = displayName(g, winner);
+    if (winner === net.id) { addXp(150); unlock("champion"); banner("You win the round!", "Next round in 8 seconds", C.gold, 4); }
+    else banner(`${R.winner} wins the round`, "Next round in 8 seconds", C.gold, 4);
+    submitStats();
+  }
+}
+
+function spawnEnemy(g, tier, x, y, hp) { // host only
+  if (g.enemies.size >= MAX_ENEMIES) return null;
+  const T = tierOf(tier), lvl = g.lv.level;
+  hp = hp ?? Math.max(1, Math.round(T.hp * (1 + (lvl - 1) * 0.2)));
+  // From level 3, some enemies spawn as elites (more often at higher levels)
+  const elite = !T.boss && !T.piece && lvl >= 3 && Math.random() < Math.min(0.35, 0.05 + lvl * 0.012);
+  if (elite) hp = Math.round(hp * 2.2);
+  const id = g.nextEid++, e = new Enemy(id, x, y, tier, hp);
+  if (elite) { e.elite = true; e.speed *= 1.2; }
+  g.enemies.set(id, e);
+  return e;
+}
+// Enemy attacks become events so every screen spawns the same shots
+function fire(g, x, y, a, spd, n, spread, tier) {
+  spawnShots(g, x, y, a, spd, n, spread, tier, 0);
+  if (g.events.length < MAX_EVENTS) g.events.push([Math.round(x), Math.round(y), Math.round(a * 1000) / 1000, spd, n, spread, tier, g.frame]);
+}
+function spawnShots(g, x, y, a, spd, n, spread, tier, age) {
+  if ((n | 0) === 0) { const T = tierOf(tier); blast(g, x, y, spread, T.blastDmg || 30, T.color); return; } // an explosion
+  n = Math.min(40, Math.max(1, n | 0));
+  for (let i = 0; i < n; i++) {
+    const ang = spread >= TAU - 0.01 ? a + i * TAU / n : a + (n > 1 ? (i / (n - 1) - 0.5) * spread : 0);
+    const s = new EnemyShot(x, y, ang, spd, tier);
+    for (let k = 0; k < Math.min(age, 12); k++) s.update();
+    g.eshots.push(s);
+  }
+}
+
+function applyWorld(g, world, t) { // non-host: take the host's enemies, kills, level and attacks (t = host time on our clock)
+  const [kills, list, lv, events] = world;
+  if (Array.isArray(lv) && lv.every(num)) applyLevel(g, lv);
+  if (Array.isArray(kills)) for (const k of kills) if (Array.isArray(k)) onKill(g, k[0], k[1], k[2]);
+  if (Array.isArray(events)) for (const ev of events.slice(0, MAX_EVENTS)) {
+    if (Array.isArray(ev) && ev.length === 8 && ev.every(num)) g.pendingEvents.push({ due: t - ev[7] * STEP * 1000 + g.worldDelay, ev });
+  }
+  if (!Array.isArray(list)) return;
+  const seen = new Set();
+  for (const r of list) {
+    if (!Array.isArray(r) || !r.slice(0, 5).every(num)) continue;
+    const [id, x, y, tier, hp] = r;
+    seen.add(id);
+    let e = g.enemies.get(id);
+    if (!e) { e = new Enemy(id, x, y, tier, hp); g.enemies.set(id, e); }
+    e.t.set(x, y); e.track.push(t, x, y);
+    if (e.tier !== tier) e.setTier(tier);
+    if (hp < e.hp) e.flash = 3;
+    e.hp = hp;
+    const fl = r[5] | 0, ph = fl & 8 ? 2 : fl & 4 ? 1 : 0;
+    e.shield = !!(fl & 1); e.windup = !!(fl & 2); e.elite = !!(fl & 16);
+    if (ph > e.phase) { e.phase = ph; if (e.T.boss) bossRage(g, e); }
+  }
+  for (const id of g.enemies.keys()) if (!seen.has(id)) g.enemies.delete(id);
+}
+function catchUp(g, level) {
+  const n = Math.max(0, level - 1);
+  for (let i = 0; i < n; i++) { g.picks++; rollOffer(g); if (g.offer) takeUpgrade(g, g.offer[Math.random() * g.offer.length | 0]); }
+  g.picks = 0; g.offer = null;
+  return n;
+}
+function applyLevel(g, s) {
+  const [level, phase, t10, remaining, bossMax] = s, L = g.lv;
+  if (!g.lvInit) { // joined mid-game: catch up with random upgrades
+    g.lvInit = true;
+    const n = catchUp(g, level);
+    if (level > 1) banner(`Joined at level ${level}`, n ? `You got ${n} random upgrade${n > 1 ? "s" : ""} to catch up` : "", C.accent);
+  } else if (level > L.level) onLevelClear(g, L.level);
+  const oldPhase = L.phase;
+  L.level = level; L.phase = phase; L.timer = t10 / 10; L.remaining = remaining; L.bossMax = bossMax;
+  if (phase === 2 && oldPhase !== 2) onWipe(g);
+  if (phase === 1 && oldPhase !== 1) onLevelStart(g);
+}
+
+// Host only: waves, bosses, breaks, wipes
+function simLevel(g, dt, targets, players) {
+  const L = g.lv;
+  if (!g.lvInit) {
+    g.lvInit = true;
+    if (net.room === "MAIN" && net.startLevel > 1 && L.level === 1) { // main room: carry on from the saved level
+      L.level = net.startLevel;
+      const n = catchUp(g, L.level);
+      banner(`Main room: level ${L.level}`, `Picking up where the squad left off. ${n} upgrades added`, C.gold, 3.5);
+    } else banner("Get ready", "Level 1 starts in a few seconds", C.accent);
+  }
+  if (L.phase !== 1) { L.timer -= dt; if (L.timer <= 0) startLevel(g, targets, players); return; }
+
+  // Everyone who's playing is dead: restart the level
+  if (!targets.length && players > 0) {
+    L.phase = 2; L.timer = 5; L.toSpawn = 0; L.bossMax = 0; g.enemies.clear();
+    onWipe(g); return;
+  }
+  L.spawnT -= dt;
+  if (L.toSpawn > 0 && L.spawnT <= 0 && targets.length && g.enemies.size < MAX_ENEMIES) {
+    const t = targets[Math.random() * targets.length | 0];
+    const lvl = L.level, pool = [
+      [1, Math.max(25, 75 - 4 * lvl)], [2, 20 + 2 * lvl], [3, lvl >= 2 ? 4 + 1.5 * lvl : 0], [4, lvl >= 3 ? 5 + 1.5 * lvl : 0],
+      [7, lvl >= 2 ? 4 + 1.2 * lvl : 0], [6, lvl >= 4 ? 4 + 1.2 * lvl : 0], [5, lvl >= 6 ? 3 + 1.2 * lvl : 0],
+    ];
+    let r = Math.random() * pool.reduce((sum, p) => sum + p[1], 0), tier = 1;
+    for (const [tt, w] of pool) if ((r -= w) < 0) { tier = tt; break; }
+    const a = rand(0, TAU);
+    spawnEnemy(g, tier, t.x + Math.cos(a) * 750, t.y + Math.sin(a) * 750);
+    L.toSpawn--;
+    L.spawnT = Math.max(0.15, 0.85 - lvl * 0.05) / Math.sqrt(Math.max(1, players));
+  }
+  L.remaining = L.toSpawn + g.enemies.size;
+  if (L.toSpawn === 0 && g.enemies.size === 0) {
+    const prev = L.level;
+    L.level++; L.phase = 0; L.timer = 8; L.bossMax = 0;
+    onLevelClear(g, prev);
+  }
+}
+function startLevel(g, targets, players) {
+  const L = g.lv, n = Math.max(1, players);
+  L.phase = 1; L.spawnT = 0.5; L.bossMax = 0;
+  L.toSpawn = Math.round((14 + L.level * 6) * (1 + 0.6 * (n - 1)));
+  if (L.level % 5 === 0) {
+    L.toSpawn = Math.round(L.toSpawn * 0.5);
+    const t = targets[0] || g.pos, a = rand(0, TAU), bossNo = L.level / 5;
+    const hp = Math.round(2400 * Math.pow(bossNo, 1.6) * (1 + 0.75 * (n - 1)));
+    const e = spawnEnemy(g, 9 + ((bossNo - 1) % 3), t.x + Math.cos(a) * 600, t.y + Math.sin(a) * 600, hp);
+    if (e) L.bossMax = hp;
+  }
+  L.remaining = L.toSpawn + g.enemies.size;
+  onLevelStart(g);
+}
+
+// ---------- Update ----------
+function update(dt) {
+  anim += 0.05;
+  if (toast > 0) toast -= dt;
+  if (state === "PLAY" && G && net) updatePlay(G, dt);
+  else { near.update(0.5, 0); far.update(0.2, 0); }
+  if (state === "JOIN" && performance.now() - roomsAt > 5000) loadRooms(); // refresh every 5s while looking
+  if (state === "MENU" && !net && performance.now() - roomsAt > 20000) loadRooms(); // keeps the main room's level fresh
+}
+
+function updatePlay(g, dt) {
+  g.frame++;
+  if (g.banners.length) { g.banners[0].t -= dt; if (g.banners[0].t <= 0) g.banners.shift(); }
+
+  // 1. Receive
+  const now = performance.now();
+  const backlog = net.inbox.length > 40; // after a hidden tab: skip old shots
+  for (const m of net.inbox.splice(0)) {
+    if (m[0] === "u") {
+      const pid = m[1], st = m[2];
+      if (!Array.isArray(st) || !st.slice(0, 5).every(num)) continue;
+      let o = g.others.get(pid), t;
+      if (!o) { g.others.set(pid, o = new Remote(st, g.tdm ? TEAM_COLORS[m[5] | 0] : pal(m[3]), m[4])); o.team = m[5] | 0; t = o.clock(st[8], m.at); o.track.buf.length = 0; o.apply(st, t); }
+      else { t = o.clock(st[8], m.at); o.apply(st, t); }
+      o.heard = now;
+      if (typeof st[12] === "string") { // admin command (the server only lets admins send these)
+        addChat(g, o.name, o.color, `used /${st[12].slice(0, 40)}`, true);
+        if (hostId(g) === net.id && !g.pvp) { const [c, ...a] = st[12].split(/\s+/); runWorld(g, c.toLowerCase(), a, pid); }
+      }
+      if (typeof m[4] === "string") { if (!o.named && !m.quiet) addChat(g, m[4], o.color, "joined the room", true); o.named = true; o.name = m[4]; }
+      if (typeof st[9] === "string" && st[9].trim()) addChat(g, o.name, o.color, st[9].slice(0, 100));
+      // Their shots appear exactly when (and where) their ship fires on our screen
+      if (!backlog && Array.isArray(st[5])) for (const s of st[5]) {
+        if (!Array.isArray(s) || s.length !== 5 || !s.every(num)) continue;
+        g.pendingShots.push({ due: t - s[3] * STEP * 1000 + o.delay, x: s[0], y: s[1], a: s[2], n: s[4] < 0 ? Math.max(-48, Math.min(-8, s[4] | 0)) : Math.min(4, Math.max(1, s[4] | 0)), color: o.color, owner: pid });
+      }
+      if (g.pvp && Array.isArray(st[7])) for (const k of st[7]) { // [killer, victim] reported by the victim
+        if (Array.isArray(k) && k[1] === pid && typeof k[0] === "string") onPvpKill(g, k[0], pid);
+      }
+      if (!g.pvp && hostId(g) === net.id && Array.isArray(st[6])) for (const h of st[6]) {
+        if (!Array.isArray(h) || !h.every(num)) continue;
+        const e = g.enemies.get(h[0]);
+        if (!e) continue;
+        damageEnemy(g, e, Math.min(h[1], 300), pid);
+      }
+      if (!g.pvp && Array.isArray(st[7]) && hostId(g) === pid) { g.worldDelay = o.delay; applyWorld(g, st[7], t); }
+    } else if (m[0] === "a" && typeof m[1] === "string") { // announcement from an admin, sent to every room
+      addChat(g, "Announcement", C.gold, m[1], true);
+      banner("Announcement", m[1], C.gold, 5);
+    } else if (m[0] === "s" && typeof m[1] === "string") {
+      addChat(g, "Server", C.gold, m[1], true);
+    } else if (m[0] === "l") {
+      const o = g.others.get(m[1]);
+      if (o) addChat(g, o.name, o.color, "left the room", true);
+      g.others.delete(m[1]);
+    }
+  }
+  for (const [id, o] of g.others) {
+    if (now - (o.heard || now) > 8000) { addChat(g, o.name, o.color, "disconnected", true); g.others.delete(id); continue; }
+    o.update(now);
+  }
+  // Release scheduled shots whose time has come (catching up any part of a frame we missed)
+  if (g.pendingShots.length) g.pendingShots = g.pendingShots.filter(p => {
+    if (p.due > now) return true;
+    const late = Math.min(12, Math.floor((now - p.due) / (STEP * 1000)));
+    if (p.n < 0) { grenade(g, p.x, p.y, p.a, p.color, true, 1, late, p.owner, -p.n); return false; }
+    for (let i = 0; i < p.n; i++) {
+      const b = new Bullet(p.x, p.y, p.a + (i - (p.n - 1) / 2) * 0.13, p.color, true, 1, 180, p.owner);
+      for (let k = 0; k < late; k++) b.update();
+      b.ox = b.pos.x; b.oy = b.pos.y;
+      g.bullets.push(b);
+    }
+    return false;
+  });
+  if (g.pendingEvents.length) g.pendingEvents = g.pendingEvents.filter(p => {
+    if (p.due > now) return true;
+    const ev = p.ev;
+    spawnShots(g, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], Math.floor((now - p.due) / (STEP * 1000)));
+    return false;
+  });
+
+  // 2. Enemies + level: run them if we're host, otherwise follow the host
+  const hosting = hostId(g) === net.id;
+  if (hosting && !g.wasHost) {
+    for (const id of g.enemies.keys()) g.nextEid = Math.max(g.nextEid, id + 1);
+    g.kills = []; g.events = [];
+    g.lv.toSpawn = Math.max(0, g.lv.remaining - g.enemies.size);
+  }
+  if (!hosting && g.wasHost) for (const e of g.enemies.values()) { e.track.buf.length = 0; e.track.push(now - g.worldDelay, e.pos.x, e.pos.y); }
+  g.wasHost = hosting;
+  for (const e of g.enemies.values()) if (e.flash > 0) e.flash--;
+  const idle = g.paused || g.chatting;
+  const frozen = idle && g.others.size === 0 && !g.pvp; // alone + paused/chatting = everything stops
+  if (g.pvp) pvpTick(g, dt);
+  else if (hosting && !frozen) {
+    const targets = [], players = (idle ? 0 : 1) + [...g.others.values()].filter(o => !o.idle && !o.away).length;
+    if (!g.ghost && !idle) targets.push(g.pos);
+    for (const o of g.others.values()) if (!o.ghost && !o.idle && !o.away) targets.push(o.t);
+    simLevel(g, dt, targets, players);
+    g.fieldT = (g.fieldT || 0) - dt;
+    if (g.fieldT <= 0) { g.fieldT = 0.25; buildField(g, targets); }
+    for (const e of g.enemies.values()) {
+      const d = e.think(g, targets, dt);
+      if (targets.length && d > 2500 && !e.T.boss) g.enemies.delete(e.id); // stray
+    }
+  } else if (!hosting && !g.pvp) for (const e of g.enemies.values()) e.follow(now, g.worldDelay);
+
+  // 3. Your own player
+  if (!idle) simPlayer(g, dt);
+  if (g.hp < g.lastHp - 0.01) { // took damage
+    if (!g.pvp && g.lv.level % 5 === 0 && g.lv.phase === 1) g.hurtLevel = g.lv.level;
+    if (g.hp > 0 && g.hp <= 5) unlock("close_call");
+  }
+  g.lastHp = g.hp;
+  if (!g.pvp && !g.ghost && !idle) { g.aliveT += dt; if (g.aliveT >= 300) unlock("survivor"); }
+  if (g.ghost) g.aliveT = 0;
+  else { g.opos.set(g.pos.x, g.pos.y); g.ocam.set(g.cam.x, g.cam.y); g.shx = g.shy = 0; g.vel.set(0, 0); }
+
+  // 4. Bullets, enemy shots, particles
+  if (!frozen) {
+    for (const b of g.bullets) {
+      b.update();
+      if (b.life <= 0) { b.dead = true; continue; }
+      for (const e of g.enemies.values()) {
+        if (!e.hits(b.pos)) continue;
+        b.dead = true; e.flash = 3;
+        if (b.nid) g.nadeTouch.set(e.id, b.nid);
+        if (!b.remote) { // only the shooter reports damage
+          if (hosting) damageEnemy(g, e, b.dmg, net.id);
+          else g.hits.set(e.id, (g.hits.get(e.id) || 0) + b.dmg);
+        }
+        break;
+      }
+      // PvP: bullets stop when they hit someone else on screen (the player who gets hit decides the damage)
+      if (g.pvp && !b.dead) for (const [id, o] of g.others) {
+        if (id === b.owner || o.ghost || o.idle || o.away || o.invuln) continue;
+        if (g.tdm && o.team === (b.owner ? (g.others.get(b.owner) || {}).team : g.team)) continue; // passes through teammates
+        if (Math.abs(lerpX(o) - b.pos.x) < 15 && Math.abs(lerpY(o) - b.pos.y) < 15) {
+          b.dead = true;
+          for (let i = 0; i < 5; i++) g.particles.push(new Particle(b.pos.x, b.pos.y, o.color, 0.6));
+          break;
+        }
+      }
+    }
+    g.bullets = g.bullets.filter(b => !b.dead);
+    for (const s of g.eshots) s.update();
+    g.eshots = g.eshots.filter(s => s.life > 0);
+  } else for (const o of [...g.bullets, ...g.eshots, ...g.enemies.values()]) { o.ox = o.pos.x; o.oy = o.pos.y; } // hold still
+  for (const p of g.particles) p.update();
+  g.particles = g.particles.filter(p => p.life > 0);
+
+  // 5. Send
+  g.sendT += dt;
+  if (g.sendT >= 1 / SEND_HZ) sendState(g, false, hosting);
+  // Heartbeat: a tiny update every 2s even when standing still, so everyone knows you're still here
+  if (performance.now() - net.lastSend > 2000) sendState(g, true, hosting);
+}
+
+// One message per tick carries your state, shots and hits, plus (if host) enemies, level and enemy attacks.
+// Nothing changed = nothing sent.
+function sendState(g, force, hosting = hostId(g) === net.id) {
+  const flags = (g.ghost ? 1 : 0) | (g.dashT > 0 ? 2 : 0) | (g.paused ? 4 : 0) | (g.invuln > 0 ? 8 : 0) | (g.away ? 16 : 0) | (g.chatting ? 32 : 0) | (rankOf(xp) << 8);
+  const st = [Math.round(g.pos.x), Math.round(g.pos.y), Math.round(g.hp / maxHp(g) * 100), flags, Math.trunc(g.score)];
+  st.push(Math.round(g.vel.x * 10), Math.round(g.vel.y * 10)); // how fast you're moving, so others can glide smoothly
+  const changed = !g.lastSent || st.some((v, i) => v !== g.lastSent[i]);
+  const world = !g.pvp && hosting && g.lvInit;
+  if (!force && !changed && !g.shots.length && !g.hits.size && !world && !g.chatOut && !g.pvpOut.length && !g.cmdOut) return;
+  const shots = g.shots.slice(-MAX_SHOTS).map(s => [s[0], s[1], s[2], g.frame - s[3], s[4]]);
+  const hits = [...g.hits].slice(0, 16);
+  const L = g.lv;
+  const w = world ? [
+    g.kills.splice(0),
+    [...g.enemies.values()].map(e => [e.id, Math.round(e.pos.x), Math.round(e.pos.y), e.tier, Math.max(0, Math.ceil(e.hp)), e.flags]),
+    [L.level, L.phase, Math.max(0, Math.round(L.timer * 10)), L.remaining, L.bossMax],
+    g.events.splice(0).map(ev => { const c = ev.slice(); c[7] = g.frame - ev[7]; return c; }),
+  ] : null;
+  const msg = [...st.slice(0, 5), shots, hits, g.pvp ? (g.pvpOut.length ? g.pvpOut.splice(0) : null) : w,
+    Math.round(performance.now()), g.chatOut || null, st[5], st[6]];
+  if (g.cmdOut) msg.push(g.cmdOut.slice(0, 60));
+  g.chatOut = null; g.cmdOut = null;
+  net.send(msg);
+  g.lastSent = st; g.shots = []; g.hits.clear(); g.sendT = 0;
+}
+
+function simPlayer(g, dt) {
+  g.opos.set(g.pos.x, g.pos.y);
+  g.vel.set(0, 0);
+  if (g.shotCd > 0) g.shotCd--;
+  if (g.dashCd > 0) g.dashCd--;
+  if (g.nadeCd > 0) g.nadeCd--;
+  if (keys.has("KeyQ") && g.nadeCd <= 0 && !g.ghost) { // grenade: a ring of heavy shots all around you
+    const x = Math.round(g.pos.x), y = Math.round(g.pos.y), a0 = Math.round(rand(0, TAU) * 1000) / 1000;
+    const n = nadeShots(g);
+    g.nadeId++;
+    grenade(g, x, y, a0, g.color, false, nadeDmg(g), 0, null, n);
+    for (const b of g.bullets) if (b.nade && !b.remote && !b.nid) b.nid = g.nadeId;
+    g.shots.push([x, y, a0, g.frame, -n]);
+    g.nadeCd = nadeDelay(g); g.shake = Math.max(g.shake, 10);
+  }
+  if (g.invuln > 0) g.invuln--;
+
+  let mx = 0, my = 0;
+  if (keys.has("KeyW")) my--; if (keys.has("KeyS")) my++;
+  if (keys.has("KeyA")) mx--; if (keys.has("KeyD")) mx++;
+  const ml = Math.hypot(mx, my), speed = 6.5 + 0.7 * g.up.speed;
+  if ((keys.has("ShiftLeft") || keys.has("ShiftRight")) && g.dashCd <= 0 && ml > 0 && !g.ghost) {
+    g.dashT = 10; g.dashCd = dashDelay(g); g.dashDir.set(mx / ml, my / ml); g.shake = Math.max(g.shake, 5);
+    if (++g.dashes >= 100) unlock("blink");
+  }
+  g.walls = getWalls(g.pos);
+  let vx = 0, vy = 0;
+  if (g.dashT > 0 && !g.ghost) { vx = g.dashDir.x * 20; vy = g.dashDir.y * 20; g.dashT--; }
+  else if (ml > 0) { vx = mx / ml * speed; vy = my / ml * speed; }
+  if (vx || vy) {
+    if (g.ghost) { g.pos.x += vx; g.pos.y += vy; }
+    else moveBox(g.pos, 12, vx, vy, g.walls);
+    if (arena) { g.pos.x = Math.max(-ARENA + 14, Math.min(ARENA - 14, g.pos.x)); g.pos.y = Math.max(-ARENA + 14, Math.min(ARENA - 14, g.pos.y)); }
+    if (!g.ghost) g.vel.set(g.pos.x - g.opos.x, g.pos.y - g.opos.y);
+    g.trail.push(new V(g.pos.x, g.pos.y));
+    if (g.trail.length > (g.dashT > 0 ? 15 : 8)) g.trail.shift();
+  } else if (g.trail.length) g.trail.shift();
+
+  if ((keys.has("Space") || mouse.down) && g.shotCd <= 0 && !g.ghost) {
+    const a = Math.round(Math.atan2(mouse.y + g.cam.y - g.pos.y, mouse.x + g.cam.x - g.pos.x) * 1000) / 1000;
+    const x = Math.round(g.pos.x), y = Math.round(g.pos.y), n = 1 + g.up.multi, dmg = 1 + g.up.dmg;
+    for (let i = 0; i < n; i++) g.bullets.push(new Bullet(x, y, a + (i - (n - 1) / 2) * 0.13, g.color, false, dmg));
+    g.shots.push([x, y, a, g.frame, n]);
+    g.shotCd = shotDelay(g);
+  }
+
+  const ocx = g.cam.x, ocy = g.cam.y;
+  g.ocam.set(ocx, ocy);
+  g.cam.x += (g.pos.x - W / 2 - g.cam.x) * 0.1;
+  g.cam.y += (g.pos.y - H / 2 - g.cam.y) * 0.1;
+  let sx = 0, sy = 0;
+  if (g.shake > 0) { sx = rand(-g.shake, g.shake); sy = rand(-g.shake, g.shake); g.shake = g.shake < 0.1 ? 0 : g.shake * 0.9; }
+  g.shx = sx; g.shy = sy;
+  near.update(g.cam.x - ocx, g.cam.y - ocy);
+  far.update(g.cam.x - ocx, g.cam.y - ocy);
+
+  if (!g.ghost) {
+    if (g.up.regen) g.hp = Math.min(maxHp(g), g.hp + 1.5 * g.up.regen * dt);
+    const hurt = g.dashT <= 0 && g.invuln <= 0 && !g.god;
+    if (hurt) {
+      for (const e of g.enemies.values()) {
+        if (Math.abs(e.pos.x - g.pos.x) < e.size + 12 && Math.abs(e.pos.y - g.pos.y) < e.size + 12) {
+          g.hp -= e.T.boss ? 4 : 1.7; g.shake = Math.max(g.shake, 6);
+        }
+      }
+      for (const s of g.eshots) {
+        if (s.life > 0 && Math.abs(s.pos.x - g.pos.x) < 17 && Math.abs(s.pos.y - g.pos.y) < 17) {
+          g.hp -= s.dmg; s.life = 0; g.shake = Math.max(g.shake, 8);
+        }
+      }
+      if (g.pvp && !g.round.over) for (const b of g.bullets) {
+        if (!b.remote || b.dead || Math.abs(b.pos.x - g.pos.x) > 15 || Math.abs(b.pos.y - g.pos.y) > 15) continue;
+        if (g.tdm && (g.others.get(b.owner) || {}).team === g.team) continue; // teammates can't hurt you
+        b.dead = true; g.hp -= b.nade ? PVP_NADE_DMG : PVP_DMG; g.shake = Math.max(g.shake, 7); g.lastHitBy = b.owner;
+        for (let i = 0; i < 6; i++) g.particles.push(new Particle(g.pos.x, g.pos.y, g.color, 0.8));
+      }
+    }
+    if (g.hp <= 0) {
+      g.hp = 0; g.ghost = true; g.respawn = g.pvp ? PVP_RESPAWN : 5; g.dashT = 0;
+      if (g.pvp && g.lastHitBy) { g.pvpOut.push([g.lastHitBy, net.id]); onPvpKill(g, g.lastHitBy, net.id); sendState(g, true); }
+    }
+  } else {
+    g.respawn -= dt;
+    if (g.respawn <= 0) {
+      const mates = [...g.others.values()].filter(o => !o.ghost).map(o => [o.t.x, o.t.y]);
+      g.ghost = false; g.hp = maxHp(g); g.invuln = 120; g.pos = g.pvp ? pvpSpawn(mates, g.tdm ? g.team : -1) : teamSpawn(mates); g.opos.set(g.pos.x, g.pos.y); g.trail = [];
+      g.lastHitBy = null; g.killedBy = null;
+    }
+  }
+}
+
+// ---------- Render ----------
+function render() {
+  buttons = [];
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  far.draw(anim * 0.5); near.draw(anim);
+
+  if (state === "MENU") drawMenu();
+  else if (state === "JOIN") drawJoin();
+  else if (state === "HOST") drawHost();
+  else if (state === "ACH") drawAch();
+  else if (state === "BANNED") drawBanned();
+  else if (state === "PASS") drawPass();
+  else if (state === "LOADING") drawLoading();
+  else if (state === "NAME") drawName();
+  else if (state === "CODE") drawCode();
+  else if (state === "BOARD") drawBoard();
+  else if (G) {
+    drawWorld(G);
+    drawHud(G);
+    if (G.paused) drawPause(G);
+  }
+
+  if (toast > 0) {
+    ctx.save(); ctx.globalAlpha = Math.min(1, toast * 2);
+    ctx.font = f(16, 600);
+    const w = ctx.measureText(toastText).width + 40;
+    panel(W / 2 - w / 2, H - 70, w, 38, 8, rgb(C.accent, 0.6));
+    text(toastText, W / 2, H - 50, f(16, 600), rgb(C.accent), "center", "middle");
+    ctx.restore();
+  }
+
+  if (sel >= buttons.length) sel = 0;
+  const overButton = buttons.some(b => hit(b) && !b.disabled);
+  const cursor = overButton ? "pointer" : state === "PLAY" && G && !G.paused ? "crosshair" : "default";
+  if (cv.style.cursor !== cursor) cv.style.cursor = cursor;
+}
+
+function drawTitle(y, size) {
+  ctx.save();
+  ctx.font = f(size, 700); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = rgb(C.mid, 0.55); ctx.fillText("NEON BREACH", W / 2 + 4, y + 2);
+  ctx.shadowColor = rgb(C.accent); ctx.shadowBlur = 30;
+  ctx.fillStyle = rgb(C.accent, Math.random() < 0.015 ? 0.4 : 1); ctx.fillText("NEON BREACH", W / 2, y);
+  ctx.restore();
+}
+
+function rankLine(x, y, w) { // badge, rank name, progress to next
+  const r = rankOf(xp), next = RANK_XP[r + 1];
+  drawBadge(x + 8, y + 8, r);
+  text(RANKS[r], x + 24, y, f(15, 700), rgb(badgeColor(r)));
+  const frac = next ? (xp - RANK_XP[r]) / (next - RANK_XP[r]) : 1;
+  const bx = x + 130, bw = w - 130;
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fillRect(bx, y + 7, bw, 4);
+  ctx.fillStyle = rgb(badgeColor(r)); ctx.fillRect(bx, y + 7, bw * Math.min(1, frac), 4);
+}
+
+function drawMenu() {
+  drawTitle(150, 96);
+  const bx = W / 2 - 170, bw = 340;
+  if (status) text(status + (net || status === "Checking room" ? ".".repeat(1 + Math.floor(anim * 2) % 3) : ""), W / 2, 208, f(16, 600), statusErr ? C.death : C.text, "center");
+  else text("Co-op survival and PvP for up to 8 players", W / 2, 208, f(18, 500), C.muted, "center");
+  if (!net) {
+    const mainRow = rooms && rooms.find(r => r[0] === "MAIN");
+    button(mainRow ? `Main room: level ${mainRow[5] || 1}` : "Play the main room", "M", bx, 240, bw, 42, playMain);
+    button("Host co-op", "H", bx, 288, bw, 42, host);
+    button("Host PvP (FFA or teams)", "P", bx, 336, bw, 42, hostPvp);
+    button("Join a room", "J", bx, 384, bw, 42, openJoin);
+    button("Leaderboard", "L", bx, 432, bw, 42, () => openBoard());
+    const got = profile ? ACH.filter(a => hasAch(a[0])).length : 0;
+    button(`Achievements  ${got}/${ACH.length}`, "A", bx, 480, bw, 42, () => goto("ACH"));
+  }
+  if (profile) {
+    const r = rankOf(xp), next = RANK_XP[r + 1];
+    panel(bx, 534, bw, 134, 10);
+    text(profile.name, bx + 20, 546, f(22, 700), C.text);
+    if (profile.admin) { ctx.font = f(22, 700); text("ADMIN", bx + 30 + ctx.measureText(profile.name).width, 552, f(12, 700), rgb(C.gold)); }
+    // this rank's trail colour
+    for (let i = 0; i < 6; i++) { ctx.strokeStyle = rgb(trailColor(r, pal(0), i / 6), 0.25 + i * 0.12); ctx.lineWidth = 1; ctx.strokeRect(bx + bw - 96 + i * 9, 550, 14, 14); }
+    rankLine(bx + 20, 580, bw - 40);
+    text(next ? `${xp.toLocaleString()} / ${next.toLocaleString()} XP to ${RANKS[r + 1]}` : `${xp.toLocaleString()} XP, max rank`,
+      bx + 20, 600, f(13, 500), C.muted);
+    text(`Best score ${profile.bestScore.toLocaleString()}     Best level ${profile.bestLevel}`, bx + 20, 620, f(13, 600), C.text);
+    text("K copies your login code, for playing on another device", bx + 20, 642, f(12, 500), C.muted);
+  }
+  text("WASD move    Shift dash    Space / click shoot    Q grenade    T chat    Esc pause", W / 2, H - 40, f(14, 500), C.muted, "center");
+}
+
+function drawBanned() {
+  drawTitle(220, 90);
+  text("You've been banned", W / 2, 320, f(30, 700), C.death, "center");
+  text(banReason || "Banned by an admin", W / 2, 366, f(18, 500), C.text, "center");
+  text("If you think this is a mistake, talk to whoever runs the game.", W / 2, 420, f(14, 500), C.muted, "center");
+}
+
+function drawAch() {
+  const got = ACH.filter(a => hasAch(a[0])).length;
+  text("Achievements", W / 2, 22, f(40, 700), C.text, "center");
+  text(`${got} of ${ACH.length} unlocked. Each one gives bonus XP.`, W / 2, 70, f(15, 500), C.muted, "center");
+  const cw = 452, ch = 40, x0 = W / 2 - cw - 8;
+  ACH.forEach(([id, name, desc, xpv], i) => {
+    const col = i % 2, row = Math.floor(i / 2), x = x0 + col * (cw + 16), y = 96 + row * (ch + 4), on = hasAch(id);
+    chamfer(x, y, cw, ch, 8);
+    ctx.fillStyle = on ? "rgba(255,200,60,0.1)" : "rgba(8,10,28,0.85)"; ctx.fill();
+    ctx.strokeStyle = on ? rgb(C.gold, 0.7) : "rgba(127,139,176,0.25)"; ctx.lineWidth = 1; ctx.stroke();
+    // tick or lock
+    ctx.strokeStyle = on ? rgb(C.gold) : C.muted; ctx.lineWidth = 2; ctx.beginPath();
+    if (on) { ctx.moveTo(x + 14, y + 21); ctx.lineTo(x + 20, y + 27); ctx.lineTo(x + 31, y + 13); }
+    else { ctx.arc(x + 22, y + 17, 4, Math.PI, 0); ctx.rect(x + 16, y + 17, 12, 10); }
+    ctx.stroke();
+    text(name, x + 42, y + 5, f(15, 700), on ? rgb(C.gold) : C.text);
+    text(desc, x + 42, y + 22, f(12, 500), C.muted);
+    text(`+${xpv.toLocaleString()} XP`, x + cw - 12, y + ch / 2 + 1, f(12, 700), on ? rgb(C.gold) : C.muted, "right", "middle");
+  });
+  button("Back", "Esc", W / 2 - 170, 682, 340, 44, () => goto("MENU"));
+}
+
+function drawHost() {
+  const pvp = hostMode !== "coop";
+  drawTitle(pvp ? 100 : 130, 72);
+  text(pvp ? "Host a PvP room" : "Host a co-op room", W / 2, pvp ? 150 : 196, f(26, 700), pvp ? rgb([255, 90, 110]) : C.text, "center");
+  const bx = W / 2 - 170, bw = 340;
+  if (pvp) { // free for all / team deathmatch switch
+    [["Free for all", "pvp"], ["Team deathmatch", "tdm"]].forEach(([label, v], i) => {
+      const x = bx + i * 174, b = { x, y: 186, w: 166, h: 42, action: () => { hostMode = v; } };
+      buttons.push(b);
+      const on = hostMode === v;
+      chamfer(x, 186, 166, 42, 10);
+      ctx.fillStyle = on ? "rgba(255,80,100,0.16)" : "rgba(8,10,28,0.8)"; ctx.fill();
+      ctx.strokeStyle = on ? rgb([255, 90, 110]) : "rgba(127,139,176,0.4)"; ctx.lineWidth = on ? 2 : 1; ctx.stroke();
+      text(label, x + 83, 208, f(16, 700), on ? rgb([255, 120, 135]) : C.text, "center", "middle");
+    });
+  }
+  // Public / private switch
+  [["Public", false], ["Private", true]].forEach(([label, v], i) => {
+    const x = bx + i * 174, b = { x, y: 240, w: 166, h: 46, action: () => { hostPrivate = v; } };
+    buttons.push(b);
+    const on = hostPrivate === v;
+    chamfer(x, 240, 166, 46, 10);
+    ctx.fillStyle = on ? "rgba(0,255,255,0.14)" : "rgba(8,10,28,0.8)"; ctx.fill();
+    ctx.strokeStyle = on ? rgb(C.accent) : "rgba(127,139,176,0.4)"; ctx.lineWidth = on ? 2 : 1; ctx.stroke();
+    text(label, x + 83, 264, f(18, 700), on ? rgb(C.accent) : C.text, "center", "middle");
+  });
+  text(hostPrivate ? "Shows in the room list with a lock. People need the password to join." : "Anyone can join from the room list.",
+    W / 2, 300, f(14, 500), C.muted, "center");
+  if (hostPrivate) inputBox("•".repeat(hostPass.length), 330, 30, 4, "Type a password");
+  const y = hostPrivate ? 430 : 340;
+  button("Create room", "Enter", bx, y, bw, 52, createRoom, hostPrivate && hostPass.length < 3);
+  button("Back", "Esc", bx, y + 64, bw, 52, () => goto("MENU"));
+  text("Tab switches public / private" + (hostMode !== "coop" ? "     Left / Right switches FFA / TDM" : "") + (hostPrivate ? "     Password: 3 to 20 characters" : ""), W / 2, H - 40, f(13, 500), C.muted, "center");
+}
+
+function drawPass() {
+  drawTitle(150, 72);
+  text(`Room ${passTarget} is private`, W / 2, 222, f(26, 700), C.text, "center");
+  text("Ask whoever made it for the password", W / 2, 258, f(15, 500), C.muted, "center");
+  inputBox("•".repeat(passInput.length), 300, 30, 4, "Password");
+  const bx = W / 2 - 170, bw = 340;
+  button(busy ? "Checking..." : "Join room", "Enter", bx, 400, bw, 52, submitPass, !passInput || busy);
+  button("Back", "Esc", bx, 464, bw, 52, () => { status = ""; openJoin(); });
+  if (status) text(status, W / 2, 536, f(16, 600), statusErr ? C.death : C.text, "center");
+}
+
+function inputBox(value, y, size, spacing, placeholder) {
+  const bx = W / 2 - 200, bw = 400;
+  panel(bx, y, bw, 76, 12, rgb(C.accent, 0.6));
+  const caret = Math.floor(anim * 2) % 2 === 0 ? "_" : "";
+  ctx.save(); ctx.letterSpacing = spacing + "px";
+  if (value) text(value + caret, W / 2 + spacing / 2, y + 40, f(size, 700), rgb(C.accent), "center", "middle");
+  else text(placeholder + caret, W / 2, y + 40, f(20, 500), C.muted, "center", "middle");
+  ctx.restore();
+}
+
+function drawLoading() {
+  drawTitle(250, 104);
+  if (statusErr) {
+    text(status, W / 2, 360, f(18, 600), C.death, "center");
+    button("Try again", "Enter", W / 2 - 170, 410, 340, 52, boot);
+  } else text("Connecting" + ".".repeat(1 + Math.floor(anim * 2) % 3), W / 2, 370, f(22, 600), C.text, "center");
+}
+
+function drawName() {
+  drawTitle(160, 72);
+  text("Pick your name", W / 2, 232, f(26, 700), C.text, "center");
+  text("It's yours for good, and everyone sees it in game and on the leaderboard", W / 2, 268, f(15, 500), C.muted, "center");
+  inputBox(nameInput, 310, 34, 2, "Type a name");
+  const bx = W / 2 - 170, bw = 340;
+  button(busy ? "Saving..." : "Create name", "Enter", bx, 410, bw, 52, createName, nameInput.trim().length < 3 || busy);
+  button("I have a login code", "Tab", bx, 474, bw, 52, () => { goto("CODE"); loginInput = ""; status = ""; });
+  if (status) text(status, W / 2, 546, f(16, 600), statusErr ? C.death : C.text, "center");
+  text("3 to 16 letters, numbers, spaces, _ or -", W / 2, H - 40, f(13, 500), C.muted, "center");
+}
+
+function drawCode() {
+  drawTitle(160, 72);
+  text("Log in with your code", W / 2, 232, f(26, 700), C.text, "center");
+  text("Press K on the main menu of your other device to copy it, then paste it here", W / 2, 268, f(15, 500), C.muted, "center");
+  inputBox(loginInput, 310, 26, 3, "Paste your login code");
+  const bx = W / 2 - 170, bw = 340;
+  button(busy ? "Checking..." : "Log in", "Enter", bx, 410, bw, 52, useCode, loginInput.length < 8 || busy);
+  button("Back", "Esc", bx, 474, bw, 52, () => { goto("NAME"); status = ""; });
+  if (status) text(status, W / 2, 546, f(16, 600), statusErr ? C.death : C.text, "center");
+}
+
+function drawBoard() {
+  text("Leaderboard", W / 2, 34, f(44, 700), C.text, "center");
+  const tabs = [["score", "High score"], ["level", "Top level"], ["pvp", "PvP kills"], ["xp", "Rank"]];
+  tabs.forEach(([k, label], i) => {
+    const x = W / 2 - 300 + i * 153;
+    button(label, `${i + 1}`, x, 100, 144, 46, () => openBoard(k));
+    if (boardTab === k) { ctx.fillStyle = rgb(C.accent); ctx.fillRect(x + 12, 150, 120, 3); }
+  });
+  panel(W / 2 - 300, 168, 600, 468, 12);
+  const data = boardRows[boardTab];
+  if (boardErr) text(boardErr, W / 2, 380, f(18, 600), C.death, "center");
+  else if (!data) text("Loading...", W / 2, 380, f(18, 600), C.muted, "center");
+  else if (!data.rows.length) text("No one's on the board yet. Be the first!", W / 2, 380, f(18, 600), C.muted, "center");
+  else data.rows.slice(0, 20).forEach(([name, rxp, best, lvl, pk], i) => {
+    const y = 182 + i * 22, me = profile && name === profile.name, r = rankOf(rxp);
+    if (me) { ctx.fillStyle = "rgba(0,255,255,0.1)"; ctx.fillRect(W / 2 - 292, y - 3, 584, 22); }
+    const col = i === 0 ? rgb(C.gold) : i === 1 ? rgb(C.silver) : i === 2 ? rgb([230, 140, 80]) : C.muted;
+    text(`${i + 1}`, W / 2 - 250, y, f(15, 700), col, "right");
+    drawBadge(W / 2 - 226, y + 8, r, 0.8);
+    text(name, W / 2 - 206, y, f(15, me ? 700 : 600), me ? rgb(C.accent) : C.text);
+    const val = boardTab === "score" ? best.toLocaleString() : boardTab === "level" ? `Level ${lvl}`
+      : boardTab === "pvp" ? `${(pk || 0).toLocaleString()} kills` : `${RANKS[r]}  ${rxp.toLocaleString()} XP`;
+    text(val, W / 2 + 280, y, f(15, 600), C.text, "right");
+  });
+  button("Back", "Esc", W / 2 - 170, 656, 340, 48, () => goto("MENU"));
+}
+
+function drawJoin() {
+  drawTitle(62, 52);
+  // Code entry
+  const ix = W / 2 - 360;
+  text("Room code", ix, 108, f(14, 600), C.muted);
+  panel(ix, 128, 300, 58, 10, rgb(C.accent, 0.6));
+  const caret = Math.floor(anim * 2) % 2 === 0 ? "_" : "";
+  ctx.save(); ctx.letterSpacing = codeInput ? "6px" : "0px";
+  text(codeInput ? codeInput + caret : "Type a code" + caret, ix + 150 + (codeInput ? 3 : 0), 158, codeInput ? f(30, 700) : f(18, 500),
+    codeInput ? rgb(C.accent) : C.muted, "center", "middle");
+  ctx.restore();
+  button("Join code", "Enter", ix + 316, 128, 196, 58, submitJoin, codeInput.length < 4);
+  button("Back", "Esc", ix + 528, 128, 192, 58, () => goto("MENU"));
+  if (status) text(status, W / 2, 196, f(14, 600), statusErr ? C.death : C.text, "center");
+
+  // Live rooms, busiest first
+  text("Rooms online", ix, 222, f(20, 700), C.text);
+  text(roomsBusy && !rooms ? "Loading..." : "Updates every few seconds", ix + 720, 226, f(13, 500), C.muted, "right");
+  panel(ix, 252, 720, 452, 12);
+  if (roomsErr && !rooms) { text(roomsErr, W / 2, 470, f(16, 600), C.death, "center"); return; }
+  if (!rooms) return;
+  if (!rooms.length) {
+    text("Nobody's playing right now", W / 2, 450, f(18, 600), C.muted, "center");
+    text("Go back and host a game, your friends will see it here", W / 2, 478, f(14, 500), C.muted, "center");
+    return;
+  }
+  rooms.slice(0, 9).forEach(([code, players, mode, names, priv, level], i) => {
+    const y = 264 + i * 48, x = ix + 12, w = 696, h = 42, full = players >= MAX_PLAYERS;
+    const b = { x, y, w, h, action: () => { if (!full) joinRoom(code); }, disabled: full };
+    const idx = buttons.length; buttons.push(b);
+    if (usingMouse && hit(b)) sel = idx;
+    const on = sel === idx && !full, pvp = mode === "pvp";
+    chamfer(x, y, w, h, 8);
+    ctx.fillStyle = on ? "rgba(0,255,255,0.1)" : "rgba(255,255,255,0.03)"; ctx.fill();
+    ctx.strokeStyle = on ? rgb(C.accent) : "rgba(127,139,176,0.25)"; ctx.lineWidth = on ? 2 : 1; ctx.stroke();
+    const isMain = code === "MAIN";
+    text(code, x + 18, y + h / 2 + 1, f(18, 700), full ? C.muted : isMain ? rgb(C.gold) : rgb(C.accent), "left", "middle");
+    if (priv) { // padlock
+      const lx = x + 90, ly = y + 15;
+      ctx.strokeStyle = rgb(C.gold); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(lx, ly + 3, 4, Math.PI, 0); ctx.stroke();
+      ctx.fillStyle = rgb(C.gold); ctx.fillRect(lx - 6, ly + 3, 12, 9);
+    }
+    const tdm = mode === "tdm", mc = isMain ? C.gold : tdm ? [170, 110, 255] : pvp ? [255, 80, 100] : C.green;
+    ctx.fillStyle = rgb(mc, 0.15); ctx.fillRect(x + 104, y + 11, 62, 20);
+    text(isMain ? `Lv ${level || 1}` : tdm ? "TDM" : pvp ? "PvP" : "Co-op", x + 135, y + h / 2 + 1, f(13, 700), rgb(mc), "center", "middle");
+    ctx.save(); ctx.beginPath(); ctx.rect(x + 180, y, 396, h); ctx.clip();
+    text(isMain && !players ? "Main room: always open, jump in and push further" : (names || []).join(", "), x + 182, y + h / 2 + 1, f(14, 500),
+      isMain && !players ? C.muted : C.text, "left", "middle");
+    ctx.restore();
+    // player pips + count
+    for (let k = 0; k < MAX_PLAYERS; k++) {
+      ctx.fillStyle = k < players ? (full ? C.muted : rgb(C.accent)) : "rgba(255,255,255,0.1)";
+      ctx.fillRect(x + 586 + k * 7, y + 17, 5, 8);
+    }
+    text(full ? "full" : `${players}/${MAX_PLAYERS}`, x + w - 14, y + h / 2 + 1, f(14, 700), full ? C.death : C.text, "right", "middle");
+  });
+}
+
+// Same drawing for you and everyone else: trail, glow, dash flash, ghost, spawn blink
+// Every rank has its own trail colour. Rank 0 uses your player colour; the top ranks shimmer through the rainbow.
+function trailColor(rank, base, k) {
+  if (!rank) return base;
+  if (rank < 24) return hue(((rank - 1) * 0.382 + 0.05) % 1);      // 23 distinct, well-spread colours
+  if (rank < 26) return hue((anim * 0.05 + k * 0.15 + rank * 0.1) % 1); // slow shimmer
+  if (rank < 28) return hue((anim * 0.12 + k * 0.5) % 1);               // rainbow along the trail
+  if (rank === 28) return k > 0.5 ? C.gold : [255, 255, 255];           // Omega: gold and white
+  return hue((anim * 0.25 + k) % 1);                                   // Neon God: fast full rainbow
+}
+function drawPlayer(pos, trail, color, dashing, ghost, blink, faded, cam, rank = 0) {
+  const px = pos.x - cam.x, py = pos.y - cam.y, col = dashing ? C.white : color;
+  ctx.save();
+  if (faded) ctx.globalAlpha = 0.4;
+  if (ghost) {
+    ctx.strokeStyle = rgb(color, 0.3); ctx.lineWidth = 2; ctx.strokeRect(px - 19, py - 19, 38, 38);
+    ctx.restore(); return;
+  }
+  ctx.lineWidth = 1;
+  trail.forEach((p, i) => {
+    const k = i / trail.length;
+    ctx.strokeStyle = rgb(dashing ? col : trailColor(rank, color, k), k * (dashing ? 1 : rank ? 0.7 : 0.47));
+    ctx.strokeRect(p.x - cam.x - 11.5, p.y - cam.y - 11.5, 23, 23);
+  });
+  if (blink) ctx.globalAlpha *= 0.35;
+  if (dashing) { // glitch: split colour ghosts + a few torn slices
+    const j = () => (Math.random() - 0.5) * 8;
+    ctx.save(); ctx.globalCompositeOperation = "lighter"; ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(255,40,90,0.75)"; ctx.strokeRect(px - 11 - 4 + j() * 0.3, py - 11, 22, 22);
+    ctx.strokeStyle = "rgba(0,220,255,0.75)"; ctx.strokeRect(px - 11 + 4 + j() * 0.3, py - 11, 22, 22);
+    for (let i = 0; i < 3; i++) {
+      const sy = py - 14 + Math.random() * 28, sw = 10 + Math.random() * 26;
+      ctx.fillStyle = i % 2 ? rgb(color, 0.7) : "rgba(255,255,255,0.6)";
+      ctx.fillRect(px - sw / 2 + j() * 2, sy, sw, 1 + Math.random() * 2);
+    }
+    ctx.restore();
+  }
+  ctx.lineWidth = 2; ctx.shadowColor = rgb(col); ctx.shadowBlur = 14;
+  ctx.strokeStyle = rgb(col); ctx.strokeRect(px - 11, py - 11, 22, 22);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#fff"; ctx.fillRect(px - 8, py - 8, 16, 16);
+  ctx.restore();
+}
+
+function drawFloor(cam) {
+  // fine grid, brighter every 4th line, dots where major lines cross
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(40,70,160,0.16)"; ctx.beginPath();
+  for (let x = Math.floor(cam.x / 100) * 100; x < cam.x + W; x += 100) { ctx.moveTo(Math.round(x - cam.x) + 0.5, 0); ctx.lineTo(Math.round(x - cam.x) + 0.5, H); }
+  for (let y = Math.floor(cam.y / 100) * 100; y < cam.y + H; y += 100) { ctx.moveTo(0, Math.round(y - cam.y) + 0.5); ctx.lineTo(W, Math.round(y - cam.y) + 0.5); }
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(60,110,255,0.22)"; ctx.beginPath();
+  for (let x = Math.floor(cam.x / 400) * 400; x < cam.x + W; x += 400) { ctx.moveTo(Math.round(x - cam.x) + 0.5, 0); ctx.lineTo(Math.round(x - cam.x) + 0.5, H); }
+  for (let y = Math.floor(cam.y / 400) * 400; y < cam.y + H; y += 400) { ctx.moveTo(0, Math.round(y - cam.y) + 0.5); ctx.lineTo(W, Math.round(y - cam.y) + 0.5); }
+  ctx.stroke();
+  const pulse = 0.35 + 0.25 * Math.sin(anim * 2);
+  ctx.fillStyle = `rgba(110,170,255,${pulse})`;
+  for (let x = Math.floor(cam.x / 400) * 400; x < cam.x + W; x += 400)
+    for (let y = Math.floor(cam.y / 400) * 400; y < cam.y + H; y += 400) ctx.fillRect(x - cam.x - 1.5, y - cam.y - 1.5, 3, 3);
+  // floor markings from the chunk generator
+  const c0x = Math.floor(cam.x / CHUNK), c0y = Math.floor(cam.y / CHUNK);
+  ctx.lineWidth = 1.5;
+  for (let cx = c0x; cx <= c0x + 2; cx++) for (let cy = c0y; cy <= c0y + 1; cy++) {
+    for (const d of chunkData(cx, cy).decor) {
+      const x = d.x - cam.x, y = d.y - cam.y;
+      if (x < -30 || y < -30 || x > W + 30 || y > H + 30) continue;
+      ctx.strokeStyle = d.k === 0 ? "rgba(0,200,255,0.18)" : d.k === 1 ? "rgba(255,60,150,0.14)" : "rgba(120,110,255,0.16)";
+      ctx.beginPath();
+      if (d.k === 0) { ctx.moveTo(x - 7, y); ctx.lineTo(x + 7, y); ctx.moveTo(x, y - 7); ctx.lineTo(x, y + 7); }
+      else if (d.k === 1) { ctx.rect(x - 14, y - 14, 28, 28); ctx.moveTo(x - 8, y - 4); ctx.lineTo(x + 8, y - 4); ctx.moveTo(x - 8, y + 4); ctx.lineTo(x + 8, y + 4); }
+      else { ctx.arc(x, y, 12, 0, TAU); ctx.moveTo(x + 4, y); ctx.arc(x, y, 4, 0, TAU); }
+      ctx.stroke();
+    }
+  }
+}
+function drawWalls(walls, cam) {
+  const glow = 0.16 + 0.05 * Math.sin(anim * 1.5);
+  for (const w of walls) {
+    const x = w.x - cam.x, y = w.y - cam.y;
+    if (x > W + 10 || y > H + 10 || x + w.w < -10 || y + w.h < -10) continue;
+    ctx.fillStyle = "#090c24"; ctx.fillRect(x, y, w.w, w.h);
+    ctx.save(); ctx.beginPath(); ctx.rect(x, y, w.w, w.h); ctx.clip(); // diagonal hatching inside
+    ctx.strokeStyle = "rgba(0,150,255,0.09)"; ctx.lineWidth = 1; ctx.beginPath();
+    for (let d = -w.h; d < w.w; d += 14) { ctx.moveTo(x + d, y + w.h); ctx.lineTo(x + d + w.h, y); }
+    ctx.stroke(); ctx.restore();
+    ctx.strokeStyle = `rgba(0,150,255,${glow})`; ctx.lineWidth = 7; ctx.strokeRect(x, y, w.w, w.h); // soft glow
+    ctx.strokeStyle = "#1aa3ff"; ctx.lineWidth = 1.5; ctx.strokeRect(x + 0.5, y + 0.5, w.w - 1, w.h - 1);
+    const c = Math.min(12, w.w / 3, w.h / 3); // bright corner brackets
+    ctx.strokeStyle = "#9be6ff"; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.moveTo(x, y + c); ctx.lineTo(x, y); ctx.lineTo(x + c, y);
+    ctx.moveTo(x + w.w - c, y); ctx.lineTo(x + w.w, y); ctx.lineTo(x + w.w, y + c);
+    ctx.moveTo(x + w.w, y + w.h - c); ctx.lineTo(x + w.w, y + w.h); ctx.lineTo(x + w.w - c, y + w.h);
+    ctx.moveTo(x + c, y + w.h); ctx.lineTo(x, y + w.h); ctx.lineTo(x, y + w.h - c);
+    ctx.stroke();
+  }
+}
+
+const viewCam = g => new V(g.ocam.x + (g.cam.x - g.ocam.x) * alpha + g.shx, g.ocam.y + (g.cam.y - g.ocam.y) * alpha + g.shy);
+
+// Arrows on the screen edge pointing at teammates and bosses that are off screen
+function drawIndicators(g) {
+  const cam = viewCam(g), cx = W / 2, cy = H / 2, me = g.pos;
+  const arrow = (wx, wy, col, label, big) => {
+    const sx = wx - cam.x, sy = wy - cam.y, m = 8;
+    if (sx > -m && sx < W + m && sy > -m && sy < H + m) return; // on screen
+    const dx = sx - cx, dy = sy - cy, inset = big ? 46 : 34;
+    const k = Math.min((W / 2 - inset) / Math.abs(dx || 1e-6), (H / 2 - inset) / Math.abs(dy || 1e-6));
+    const px = cx + dx * k, py = cy + dy * k, a = Math.atan2(dy, dx), sz = big ? 16 + 3 * Math.sin(anim * 6) : 11;
+    ctx.save();
+    ctx.translate(px, py); ctx.rotate(a);
+    ctx.shadowColor = rgb(col); ctx.shadowBlur = big ? 16 : 8;
+    ctx.fillStyle = rgb(col);
+    ctx.beginPath(); ctx.moveTo(sz, 0); ctx.lineTo(-sz * 0.7, -sz * 0.75); ctx.lineTo(-sz * 0.35, 0); ctx.lineTo(-sz * 0.7, sz * 0.75); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    const dist = Math.round(Math.hypot(wx - me.x, wy - me.y) / 10);
+    const lx = px - Math.cos(a) * (big ? 34 : 26), ly = py - Math.sin(a) * (big ? 34 : 26);
+    text(label, lx, ly - 8, f(big ? 14 : 12, 700), rgb(col), "center", "middle");
+    text(`${dist}m`, lx, ly + 7, f(11, 600), C.muted, "center", "middle");
+  };
+  for (const o of g.others.values()) arrow(lerpX(o), lerpY(o), o.color, short(o.name, 10), false);
+  for (const e of g.enemies.values()) if (e.T.boss) arrow(lerpX(e), lerpY(e), e.color, "BOSS", true);
+}
+
+function drawChat(g) {
+  const now = performance.now(), x = 20, lineH = 20;
+  const lines = g.chat.filter(c => g.chatting || now - c.t < 10000).slice(g.chatting ? -10 : -6);
+  let y = H - (g.chatting ? 70 : 64) - lines.length * lineH;
+  ctx.save();
+  for (const c of lines) {
+    const age = now - c.t;
+    ctx.globalAlpha = g.chatting ? 1 : Math.min(1, (10000 - age) / 1500);
+    ctx.font = f(15, 700);
+    const nm = c.system ? c.name + " " : c.name + ": ";
+    const nw = ctx.measureText(nm).width, tw = (ctx.font = f(15, 500), ctx.measureText(c.text).width);
+    ctx.fillStyle = "rgba(2,2,10,0.55)"; ctx.fillRect(x - 6, y - 2, nw + tw + 12, lineH);
+    text(nm, x, y, f(15, 700), rgb(c.color));
+    text(c.text, x + nw, y, f(15, c.system ? 500 : 500), c.system ? C.muted : C.text);
+    y += lineH;
+  }
+  ctx.restore();
+  if (g.chatting) {
+    panel(16, H - 58, 520, 42, 8, rgb(C.accent, 0.6));
+    const caret = Math.floor(anim * 2) % 2 === 0 ? "_" : "";
+    ctx.save(); ctx.beginPath(); ctx.rect(20, H - 58, 420, 42); ctx.clip();
+    ctx.font = f(16, 500);
+    const tw = ctx.measureText(g.chatInput).width, off = Math.max(0, tw - 390);
+    text(g.chatInput ? g.chatInput + caret : "Say something" + caret, 32 - off, H - 37, f(16, 500), g.chatInput ? C.text : C.muted, "left", "middle");
+    ctx.restore();
+    text("Enter send   Esc cancel", 526, H - 37, f(12, 500), C.muted, "right", "middle");
+  }
+}
+
+function drawWorld(g) {
+  const cam = viewCam(g);
+  if (arena) { // darken outside the arena, glowing edge
+    const ax = -ARENA - cam.x, ay = -ARENA - cam.y, aw = ARENA * 2;
+    ctx.save();
+    ctx.fillStyle = "rgba(40,0,10,0.55)"; ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.rect(ax, ay, aw, aw); ctx.fill("evenodd");
+    ctx.shadowColor = "#ff2050"; ctx.shadowBlur = 16; ctx.lineWidth = 3;
+    ctx.strokeStyle = rgb([255, 40, 80], 0.7 + 0.3 * Math.sin(anim * 3)); ctx.strokeRect(ax, ay, aw, aw);
+    ctx.restore();
+  }
+  ctx.lineWidth = 2;
+  drawFloor(cam);
+  drawWalls(g.walls, cam);
+
+  const blinkOn = t => Math.floor(anim * 2.5) % 2 === 0 && t;
+  for (const [id, o] of g.others) {
+    const op = new V(lerpX(o), lerpY(o));
+    drawPlayer(op, o.trail, o.color, o.dash, o.ghost, blinkOn(o.invuln), o.idle || o.away, cam, o.rank);
+    if (o.ghost) continue;
+    const x = op.x - cam.x, y = op.y - cam.y;
+    ctx.save(); if (o.idle || o.away) ctx.globalAlpha = 0.4;
+    ctx.fillStyle = "rgba(255,255,255,0.1)"; ctx.fillRect(x - 16, y - 22, 32, 4);
+    ctx.fillStyle = rgb(C.green); ctx.fillRect(x - 16, y - 22, Math.max(0, Math.min(100, o.hp)) * 0.32, 4);
+    const label = o.chat ? `${o.name} (typing...)` : o.paused || o.away ? `${o.name} (paused)` : o.name;
+    ctx.font = f(12, 600);
+    const lw = ctx.measureText(label).width;
+    drawBadge(x - lw / 2 - 9, y - 34, o.rank, 0.8);
+    text(label, x + 6, y - 26, f(12, 600), rgb(o.color), "center", "bottom");
+    ctx.restore();
+  }
+  drawPlayer(new V(g.opos.x + (g.pos.x - g.opos.x) * alpha, g.opos.y + (g.pos.y - g.opos.y) * alpha), g.trail, g.color, g.dashT > 0, g.ghost, g.invuln > 0 && Math.floor(g.invuln / 6) % 2 === 0, false, cam, rankOf(xp));
+
+  for (const b of g.bullets) b.draw(cam);
+  g.rings = g.rings.filter(r => (r.t += 0.045) < 1);
+  for (const r of g.rings) {
+    ctx.strokeStyle = `rgba(255,120,60,${1 - r.t})`; ctx.lineWidth = 4 * (1 - r.t) + 1;
+    ctx.beginPath(); ctx.arc(r.x - cam.x, r.y - cam.y, r.r * (0.3 + 0.7 * r.t), 0, TAU); ctx.stroke();
+  }
+  for (const e of g.enemies.values()) e.draw(cam);
+  for (const s of g.eshots) s.draw(cam);
+  for (const p of g.particles) p.draw(cam);
+}
+
+function drawHud(g) {
+  if (g.healFx > 0) { vignette(C.green, 0.35 * g.healFx); g.healFx = Math.max(0, g.healFx - 0.03); }
+  if (g.ghost) vignette([255, 0, 50], 0.55);
+  else if (g.hp / maxHp(g) < 0.35) vignette([255, 0, 50], (0.2 + 0.12 * Math.sin(anim * 4)) * (1 - g.hp / maxHp(g) / 0.35));
+
+  // Top-left: hull, dash, rank
+  panel(16, 16, 300, 138);
+  const frac = g.hp / maxHp(g);
+  const hpCol = frac > 0.6 ? rgb(C.green) : frac > 0.3 ? rgb(C.weak) : C.death;
+  ctx.fillStyle = rgb(g.color); ctx.fillRect(32, 30, 10, 10);
+  text("Hull", 50, 26, f(14, 600), C.muted);
+  text(`${Math.ceil(g.hp)}`, 300, 24, f(18, 700), hpCol, "right");
+  segBar(32, 48, 268, 12, frac, hpCol);
+  const dr = 1 - g.dashCd / dashDelay(g);
+  text("Dash", 32, 72, f(14, 600), C.muted);
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fillRect(76, 79, 120, 5);
+  ctx.fillStyle = dr >= 1 ? rgb(g.color) : C.muted; ctx.fillRect(76, 79, 120 * Math.min(1, dr), 5);
+  text(`${g.others.size + 1}/${MAX_PLAYERS} online`, 300, 72, f(14, 600), C.text, "right");
+  if (g.god) text("GOD MODE", 92, 28, f(12, 700), rgb(C.gold));
+  const nr = 1 - g.nadeCd / nadeDelay(g);
+  text("Grenade (Q)", 32, 94, f(14, 600), C.muted);
+  ctx.fillStyle = "rgba(255,255,255,0.07)"; ctx.fillRect(120, 101, 76, 5);
+  ctx.fillStyle = nr >= 1 ? rgb(g.color) : C.muted; ctx.fillRect(120, 101, 76 * Math.min(1, nr), 5);
+  if (nr >= 1) text("ready", 300, 94, f(14, 600), rgb(g.color), "right");
+  ctx.fillStyle = C.edge; ctx.fillRect(32, 118, 268, 1);
+  rankLine(32, 128, 268);
+
+  // Top-center: level + boss (co-op) or round info (pvp)
+  const L = g.lv;
+  if (g.pvp) {
+    panel(W / 2 - 130, 16, 260, 56, 10, rgb([255, 70, 90], 0.5));
+    if (g.tdm) {
+      const k = teamKills(g);
+      text(`${k[0]}`, W / 2 - 60, 20, f(30, 700), rgb(TEAM_COLORS[0]), "center");
+      text(`${k[1]}`, W / 2 + 60, 20, f(30, 700), rgb(TEAM_COLORS[1]), "center");
+      text("vs", W / 2, 28, f(14, 600), C.muted, "center");
+      text(g.round.over ? `Next round in ${Math.ceil(g.round.timer)}` : `Team deathmatch, first to ${TDM_TO_WIN}`, W / 2, 54, f(12, 500), C.muted, "center");
+    } else {
+    text("Free for all", W / 2, 22, f(22, 700), rgb([255, 90, 110]), "center");
+    text(g.round.over ? `Next round in ${Math.ceil(g.round.timer)}` : `First to ${KILLS_TO_WIN}     You: ${g.score} kills, ${g.deaths.get(net.id) || 0} deaths`,
+      W / 2, 50, f(14, 500), C.muted, "center");
+    }
+  } else {
+  panel(W / 2 - 120, 16, 240, 56);
+  text(`Level ${L.level}`, W / 2, 22, f(22, 700), C.text, "center");
+  const sub = !g.lvInit ? "Waiting for host" : L.phase === 1 ? `${L.remaining} enem${L.remaining === 1 ? "y" : "ies"} left`
+    : L.phase === 2 ? `Restarting in ${Math.ceil(L.timer)}` : L.level === 1 ? `Starting in ${Math.ceil(L.timer)}` : `Next level in ${Math.ceil(L.timer)}`;
+  text(sub, W / 2, 50, f(14, 500), C.muted, "center");
+  let boss = null;
+  for (const e of g.enemies.values()) if (e.T.boss) { boss = e; break; }
+  if (boss) {
+    const bm = Math.max(boss.hp, L.bossMax || boss.maxHp || 1);
+    panel(W / 2 - 180, 80, 360, 44, 8, rgb(boss.color, 0.6));
+    text(boss.shield ? `${boss.T.boss}  shielded: kill its heads` : boss.phase ? `${boss.T.boss}  ${boss.phase === 2 ? "berserk" : "enraged"}` : boss.T.boss,
+      W / 2 - 164, 88, f(15, 700), boss.phase ? C.death : rgb(boss.color));
+    text(`${Math.max(0, Math.ceil(boss.hp))}`, W / 2 + 164, 88, f(14, 600), C.text, "right");
+    ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(W / 2 - 164, 108, 328, 6);
+    ctx.fillStyle = rgb(boss.color); ctx.fillRect(W / 2 - 164, 108, 328 * Math.max(0, boss.hp / bm), 6);
+  }
+  }
+
+  // Top-right: score + leaderboard
+  const board = [["You", Math.trunc(g.score), g.color, true], ...[...g.others].map(([id, o]) => [short(o.name, 12), Math.trunc(o.score), o.color, false])]
+    .sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const ph = 66 + board.length * 22;
+  panel(W - 236, 16, 220, ph);
+  text(g.pvp ? "Kills" : "Score", W - 220, 26, f(14, 600), C.muted);
+  text(`${Math.trunc(g.score)}`, W - 32, 22, f(28, 700), C.text, "right");
+  ctx.fillStyle = C.edge; ctx.fillRect(W - 220, 62, 188, 1);
+  board.forEach(([n, s, col, me], i) => {
+    const y = 72 + i * 22;
+    ctx.fillStyle = rgb(col); ctx.fillRect(W - 220, y + 4, 8, 8);
+    text(n, W - 204, y, f(15, me ? 700 : 500), me ? C.text : "#c8d0e8");
+    text(`${s}`, W - 32, y, f(15, me ? 700 : 500), me ? C.text : "#c8d0e8", "right");
+  });
+
+  drawIndicators(g);
+  if (!g.paused) {
+    drawChat(g);
+    if (!g.chatting) {
+      panel(16, H - 52, 300, 36, 8);
+      text(`Room ${net.room}${g.tdm ? "  TDM" : g.pvp ? "  PvP" : ""}`, 30, H - 34, f(16, 700), rgb(g.pvp ? [255, 90, 110] : C.accent), "left", "middle");
+      text("T chat    Esc menu", 302, H - 34, f(14, 500), C.muted, "right", "middle");
+    }
+  }
+
+  // Banner
+  const b = g.banners[0];
+  if (b && !g.paused) {
+    const t = b.dur - b.t, a = Math.min(1, t * 4, b.t * 2);
+    ctx.save(); ctx.globalAlpha = a;
+    ctx.shadowColor = rgb(b.color); ctx.shadowBlur = 24;
+    text(b.title, W / 2, 200 - (1 - Math.min(1, t * 4)) * 12, f(52, 700), rgb(b.color), "center", "middle");
+    ctx.shadowBlur = 0;
+    if (b.sub) text(b.sub, W / 2, 240, f(18, 600), C.text, "center", "middle");
+    ctx.restore();
+  }
+
+  if (g.ghost) {
+    ctx.save(); ctx.shadowColor = C.death; ctx.shadowBlur = 24;
+    text(g.pvp ? "ELIMINATED" : "CONNECTION LOST", W / 2, H / 2 - 40, f(64, 700), C.death, "center", "middle");
+    ctx.restore();
+    const rs = g.pvp ? PVP_RESPAWN : 5, fr = Math.min(1, Math.max(0, (rs - g.respawn) / rs));
+    ctx.fillStyle = "rgba(255,255,255,0.1)"; ctx.fillRect(W / 2 - 150, H / 2 + 10, 300, 4);
+    ctx.fillStyle = C.text; ctx.fillRect(W / 2 - 150, H / 2 + 10, 300 * fr, 4);
+    text(g.pvp ? `${g.killedBy ? "By " + displayName(g, g.killedBy) + ".  " : ""}Respawning in ${Math.max(1, Math.ceil(g.respawn))}`
+      : `Rebooting next to your team in ${Math.max(1, Math.ceil(g.respawn))}`, W / 2, H / 2 + 30, f(18, 600), C.text, "center");
+  }
+
+  if (showCards(g)) drawCards(g);
+}
+
+function drawCards(g) {
+  const cw = 220, ch = 118, gap = 16, x0 = W / 2 - (cw * 3 + gap * 2) / 2, y = H - 200;
+  text(g.picks > 1 ? `Choose an upgrade (${g.picks} to pick)` : "Choose an upgrade", W / 2, y - 26, f(15, 600), C.text, "center");
+  g.offer.forEach((u, i) => {
+    const x = x0 + i * (cw + gap), b = { x, y, w: cw, h: ch, action: () => pickUpgrade(i) };
+    buttons.push(b);
+    const on = hit(b);
+    chamfer(x, y, cw, ch, 12);
+    ctx.fillStyle = on ? "rgba(0,255,255,0.14)" : "rgba(8,10,28,0.9)"; ctx.fill();
+    ctx.strokeStyle = on ? rgb(C.accent) : rgb(C.accent, 0.35); ctx.lineWidth = on ? 2 : 1; ctx.stroke();
+    text(`${i + 1}`, x + cw - 16, y + 14, f(14, 700), C.muted, "right");
+    text(u.name, x + 18, y + 16, f(20, 700), on ? rgb(C.accent) : C.text);
+    text(u.desc, x + 18, y + 48, f(14, 500), C.muted);
+    for (let p = 0; p < u.max; p++) { // level pips
+      ctx.fillStyle = p < g.up[u.k] ? rgb(C.accent) : p === g.up[u.k] ? rgb(C.accent, 0.45) : "rgba(255,255,255,0.1)";
+      ctx.fillRect(x + 18 + p * 18, y + ch - 24, 12, 6);
+    }
+  });
+}
+
+function drawPause(g) {
+  ctx.fillStyle = "rgba(2,2,10,0.7)"; ctx.fillRect(0, 0, W, H);
+  const pw = 400, ph = 370, px = W / 2 - pw / 2, py = H / 2 - ph / 2;
+  chamfer(px, py, pw, ph, 16); ctx.fillStyle = "#05071a"; ctx.fill();
+  panel(px, py, pw, ph, 16, rgb(C.accent, 0.5));
+  text("Paused", W / 2, py + 34, f(40, 700), C.text, "center");
+  text(`Room ${net.room}     ${g.tdm ? "Team deathmatch" : g.pvp ? "PvP" : "Level " + g.lv.level}     ${g.others.size + 1}/${MAX_PLAYERS} online`, W / 2, py + 86, f(16, 600), C.muted, "center");
+  const bx = px + 40, bw = pw - 80;
+  button("Resume", "Esc", bx, py + 125, bw, 52, resume);
+  button("Copy invite link", "C", bx, py + 189, bw, 52, copyInvite);
+  button("Leave game", "", bx, py + 253, bw, 52, leave);
+  text(g.pvp ? "You can't shoot or be hit while paused" : g.others.size ? "Enemies ignore you while you're paused" : "The game is frozen while you're paused",
+    W / 2, py + ph - 34, f(13, 500), C.muted, "center");
+}
+
+// ---------- Loop (fixed 60 Hz logic so 120/144 Hz screens play the same) ----------
+let acc = 0, last = performance.now();
+function frame(now) {
+  acc += Math.min(0.25, (now - last) / 1000); last = now;
+  let steps = 0;
+  while (acc >= STEP && steps < 5) { update(STEP); acc -= STEP; steps++; }
+  if (steps === 5) acc = 0;
+  alpha = acc / STEP;
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+boot();
+</script>
+</body>
+</html>

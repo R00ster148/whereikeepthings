@@ -577,13 +577,13 @@ const nadeDmg = g => (1 + g.up.dmg) * Math.min(3, 2 + 0.05 * cleared(g)); // x2 
 // Enemy types. 4 shoots back, 9 and up are bosses (sides = outline shape, hpMul scales boss health).
 const TIERS = {
   1: { hp: 3, speed: 4.4, size: 10, color: C.weak, pts: 150, xp: 5 },
-  2: { hp: 10, speed: 2.8, size: 18, color: C.mid, pts: 300, xp: 10 },
-  3: { hp: 30, speed: 1.4, size: 30, color: C.strong, pts: 450, xp: 18 },
-  4: { hp: 9, speed: 2.0, size: 14, color: [255, 110, 40], pts: 400, xp: 15, shooter: true, dmg: 12 },
-  5: { hp: 4, speed: 5.0, size: 13, color: [255, 50, 30], pts: 350, xp: 12, kamikaze: true, blast: 115, blastDmg: 45, name: "Kamikaze" },
-  6: { hp: 8, speed: 2.5, size: 14, color: [140, 255, 60], pts: 350, xp: 12, dasher: true, name: "Dasher" },
-  7: { hp: 18, speed: 2.2, size: 22, color: [0, 230, 200], pts: 400, xp: 12, splitter: true, name: "Splitter" },
-  8: { hp: 3, speed: 4.8, size: 9, color: [0, 230, 200], pts: 100, xp: 4, piece: true },
+  2: { hp: 8, speed: 2.8, size: 18, color: C.mid, pts: 300, xp: 10 },
+  3: { hp: 22, speed: 1.4, size: 30, color: C.strong, pts: 450, xp: 18 },
+  4: { hp: 7, speed: 2.0, size: 14, color: [255, 110, 40], pts: 400, xp: 15, shooter: true, dmg: 12 },
+  5: { hp: 3, speed: 5.0, size: 13, color: [255, 50, 30], pts: 350, xp: 12, kamikaze: true, blast: 115, blastDmg: 45, name: "Kamikaze" },
+  6: { hp: 6, speed: 2.5, size: 14, color: [140, 255, 60], pts: 350, xp: 12, dasher: true, name: "Dasher" },
+  7: { hp: 13, speed: 2.2, size: 22, color: [0, 230, 200], pts: 400, xp: 12, splitter: true, name: "Splitter" },
+  8: { hp: 2, speed: 4.8, size: 9, color: [0, 230, 200], pts: 100, xp: 4, piece: true },
   9: { hp: 300, speed: 1.1, size: 50, color: [255, 60, 90], pts: 5000, xp: 200, boss: "The Sentinel", dmg: 12, hpMul: 0.85, hint: "Weave through the gaps in its rings" },
   10: { hp: 300, speed: 1.4, size: 46, color: [60, 255, 210], pts: 5000, xp: 200, boss: "The Hydra", dmg: 12, hpMul: 0.85, hint: "Kill its heads to break the shield" },
   11: { hp: 300, speed: 1.2, size: 52, color: [255, 200, 60], pts: 5000, xp: 200, boss: "The Overseer", dmg: 18, hint: "Sidestep its charges" },
@@ -596,7 +596,7 @@ const TIERS = {
 // Every 5th level brings the next boss in this order, then the list repeats
 const BOSSES = [9, 10, 11, 12, 13, 14, 15, 16];
 const bossTier = no => BOSSES[(Math.max(1, no) - 1) % BOSSES.length];
-const bossHp = (no, players, tier) => Math.round(2400 * Math.pow(no, 1.6) * (1 + 0.75 * (players - 1)) * (tierOf(tier).hpMul || 1));
+const bossHp = (no, players, tier) => Math.round(1600 * Math.pow(no, 1.45) * (1 + 0.75 * (players - 1)) * (tierOf(tier).hpMul || 1));
 const tierOf = t => TIERS[t] || TIERS[1];
 
 // ---------- Entities ----------
@@ -1856,10 +1856,10 @@ function pvpTick(g, dt) {
 function spawnEnemy(g, tier, x, y, hp) { // host only
   if (g.enemies.size >= MAX_ENEMIES) return null;
   const T = tierOf(tier), lvl = g.lv.level;
-  hp = hp ?? Math.max(1, Math.round(T.hp * (1 + (lvl - 1) * 0.2)));
+  hp = hp ?? Math.max(1, Math.round(T.hp * (1 + (lvl - 1) * 0.12)));
   // From level 3, some enemies spawn as elites (more often at higher levels)
   const elite = !T.boss && !T.piece && lvl >= 3 && Math.random() < Math.min(0.35, 0.05 + lvl * 0.012);
-  if (elite) hp = Math.round(hp * 2.2);
+  if (elite) hp = Math.round(hp * 1.8);
   const id = g.nextEid++, e = new Enemy(id, x, y, tier, hp);
   if (elite) { e.elite = true; e.speed *= 1.2; }
   g.enemies.set(id, e);

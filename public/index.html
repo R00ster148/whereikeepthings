@@ -8,6 +8,9 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#02020a">
 <title>Neon Breach</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="icon" type="image/png" sizes="64x64" href="favicon-64.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&display=swap" rel="stylesheet">
@@ -1265,7 +1268,9 @@ function connect(room, mode, pw) {
   status = "Connecting"; statusErr = false;
   const n = new Net(room, mode, pw);
   net = n;
-  n.onReady = () => { arena = n.mode !== "coop"; G = newGame(); goto("PLAY"); status = ""; setUrl(room); if (G.pvp) pvpStart(G); };
+  n.onReady = () => {
+    arena = n.mode !== "coop"; G = newGame();
+    if (n.room === ownRoom && !G.pvp) { G.own = true; G.loadSave = pendingSave; pendingSave = null; } goto("PLAY"); status = ""; setUrl(room); if (G.pvp) pvpStart(G); };
   n.onEnd = (was, code, reason) => {
     submitStats(); voice.stop();
     net = null; G = null; goto("MENU"); statusErr = true; setUrl(null);
@@ -1277,12 +1282,26 @@ function connect(room, mode, pw) {
 }
 const newCode = () => Array.from({ length: 5 }, () => ROOM_CHARS[Math.random() * ROOM_CHARS.length | 0]).join("");
 let hostMode = "coop", hostPrivate = false, hostPass = "", passTarget = "", passInput = "";
-const openHost = mode => { hostMode = mode; hostPrivate = false; hostPass = ""; status = ""; goto("HOST"); };
+// Saved games: co-op rooms you create save your level, upgrades and score each time a level is cleared.
+// Hosting co-op again lets you continue from there (one save per account, kept on the server).
+let hostContinue = false, ownRoom = null, pendingSave = null;
+const savedGame = () => profile && profile.save && profile.save.level > 1 ? profile.save : null;
+const openHost = mode => { hostMode = mode; hostPrivate = false; hostPass = ""; status = ""; hostContinue = mode === "coop" && !!savedGame(); goto("HOST"); };
 const host = () => openHost("coop");
 const hostPvp = () => openHost("pvp");
 function createRoom() {
   if (hostPrivate && hostPass.length < 3) return;
-  goto("MENU"); connect(newCode(), hostMode, hostPrivate ? hostPass : "");
+  const code = newCode();
+  ownRoom = hostMode === "coop" ? code : null;
+  pendingSave = hostMode === "coop" && hostContinue ? savedGame() : null;
+  goto("MENU"); connect(code, hostMode, hostPrivate ? hostPass : "");
+}
+function saveGame(g, level = g.lv.level) {
+  if (!token || !g.own || g.pvp) return;
+  const save = { level, score: Math.trunc(g.score), up: {}, picks: g.picks };
+  for (const u of UPGRADES) save.up[u.k] = g.up[u.k];
+  if (profile) profile.save = save;
+  api("/api/save", { token, save }).catch(() => {});
 }
 const playMain = () => { goto("MENU"); connect("MAIN"); };
 // Joining: ask the room first, so private rooms can ask for the password
@@ -1345,6 +1364,7 @@ function pickUpgrade(i) {
   const u = g.offer[i];
   takeUpgrade(g, u);
   showToast(`${u.name} ${"I".repeat(g.up[u.k])}`);
+  if (g.lv.phase === 0) saveGame(g);
 }
 
 function onKey(e) {
@@ -1365,6 +1385,7 @@ function onKey(e) {
     if (e.code === "Escape") goto("MENU");
     else if (e.code === "Tab") hostPrivate = !hostPrivate;
     else if ((e.code === "ArrowLeft" || e.code === "ArrowRight") && hostMode !== "coop") hostMode = hostMode === "pvp" ? "tdm" : "pvp";
+    else if ((e.code === "ArrowLeft" || e.code === "ArrowRight") && savedGame()) hostContinue = !hostContinue;
     else if (e.code === "Enter") createRoom();
     else if (hostPrivate && e.code === "Backspace") hostPass = hostPass.slice(0, -1);
     else if (hostPrivate && e.key.length === 1 && e.key !== " " && hostPass.length < 20) hostPass += e.key;
@@ -1769,6 +1790,7 @@ function onLevelClear(g, prev) {
   if (net.room === "MAIN") unlock("main_room");
   if (prev % 5 === 0 && g.watchLevel === prev && g.hurtLevel !== prev) unlock("untouchable");
   submitStats();
+  saveGame(g, prev + 1);
   if (g.ghost) { g.ghost = false; g.invuln = 90; g.pos = teamSpawn([...g.others.values()].filter(o => !o.ghost).map(o => [o.t.x, o.t.y])); g.opos.set(g.pos.x, g.pos.y); g.trail = []; }
   g.hp = maxHp(g);
   banner(`Level ${prev} cleared`, "Hull repaired, dash and grenade improved. Pick an upgrade: 1, 2 or 3", C.green);
@@ -1937,6 +1959,14 @@ function simLevel(g, dt, targets, players) {
       L.level = net.startLevel;
       const n = catchUp(g, L.level);
       banner(`Main room: level ${L.level}`, `Picking up where the squad left off. ${n} upgrades added`, C.gold, 3.5);
+    } else if (g.loadSave && L.level === 1) { // your own room, continuing a saved game
+      const sv = g.loadSave;
+      g.loadSave = null;
+      L.level = Math.max(1, sv.level | 0); g.score = sv.score || 0;
+      for (const u of UPGRADES) g.up[u.k] = Math.min(u.max, (sv.up || {})[u.k] | 0);
+      g.hp = maxHp(g); g.picks = sv.picks | 0;
+      if (g.picks) rollOffer(g);
+      banner(`Save loaded: level ${L.level}`, "Your upgrades and score are back", C.gold, 3.5);
     } else banner("Get ready", "Level 1 starts in a few seconds", C.accent);
   }
   if (L.phase !== 1) { L.timer -= dt; if (L.timer <= 0) startLevel(g, targets, players); return; }
@@ -2457,10 +2487,22 @@ function drawShop() {
 }
 
 function drawHost() {
-  const pvp = hostMode !== "coop";
-  drawTitle(pvp ? 100 : 130, 72);
-  text(pvp ? "Host a PvP room" : "Host a co-op room", W / 2, pvp ? 150 : 196, f(26, 700), pvp ? rgb([255, 90, 110]) : C.text, "center");
+  const pvp = hostMode !== "coop", sv = !pvp && savedGame(), top = pvp || sv;
+  drawTitle(top ? 100 : 130, 72);
+  text(pvp ? "Host a PvP room" : "Host a co-op room", W / 2, top ? 150 : 196, f(26, 700), pvp ? rgb([255, 90, 110]) : C.text, "center");
   const bx = W / 2 - 170, bw = 340;
+  if (sv) { // continue your saved game / start again
+    [[`Continue: level ${sv.level}`, true], ["New game", false]].forEach(([label, v], i) => {
+      const x = bx + i * 174, b = { x, y: 186, w: 166, h: 42, action: () => { hostContinue = v; } };
+      buttons.push(b);
+      const on = hostContinue === v;
+      chamfer(x, 186, 166, 42, 10);
+      ctx.fillStyle = on ? "rgba(255,200,60,0.14)" : "rgba(8,10,28,0.8)"; ctx.fill();
+      ctx.strokeStyle = on ? rgb(C.gold) : "rgba(127,139,176,0.4)"; ctx.lineWidth = on ? 2 : 1; ctx.stroke();
+      text(label, x + 83, 208, f(16, 700), on ? rgb(C.gold) : C.text, "center", "middle");
+    });
+    if (!hostContinue) text("Clearing a level in the new game replaces your save", W / 2, 232, f(12, 500), C.muted, "center");
+  }
   if (pvp) { // free for all / team deathmatch switch
     [["Free for all", "pvp"], ["Team deathmatch", "tdm"]].forEach(([label, v], i) => {
       const x = bx + i * 174, b = { x, y: 186, w: 166, h: 42, action: () => { hostMode = v; } };
@@ -2488,7 +2530,7 @@ function drawHost() {
   const y = hostPrivate ? 430 : 340;
   button("Create room", "Enter", bx, y, bw, 52, createRoom, hostPrivate && hostPass.length < 3);
   button("Back", "Esc", bx, y + 64, bw, 52, () => goto("MENU"));
-  text("Tab switches public / private" + (hostMode !== "coop" ? "     Left / Right switches FFA / TDM" : "") + (hostPrivate ? "     Password: 3 to 20 characters" : ""), W / 2, H - 40, f(13, 500), C.muted, "center");
+  text("Tab switches public / private" + (hostMode !== "coop" ? "     Left / Right switches FFA / TDM" : savedGame() ? "     Left / Right: continue or new game" : "") + (hostPrivate ? "     Password: 3 to 20 characters" : ""), W / 2, H - 40, f(13, 500), C.muted, "center");
 }
 
 function drawPass() {

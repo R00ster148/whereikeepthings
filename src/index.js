@@ -12,6 +12,8 @@ const SHOP = {
   aura: [0, 25000, 70000, 120000, 250000],
   tag: [0, 60000, 100000, 500000],
 };
+// Upgrade limits, for checking saved games. Keep in sync with UPGRADES in public/index.html.
+const UP_MAX = { rate: 4, dmg: 5, multi: 3, speed: 4, hull: 4, regen: 4 };
 const shopPrice = (slot, i) => Object.hasOwn(SHOP, slot) && Number.isInteger(i) ? SHOP[slot][i] : undefined;
 // Admins are set in wrangler.toml: ADMINS = "Name1,Name2" (account names, not case-sensitive)
 const isAdmin = (env, name) => !!name && String(env.ADMINS || "").split(",").map(n => n.trim().toLowerCase()).filter(Boolean).includes(name.toLowerCase());
@@ -227,6 +229,7 @@ export class Board extends DurableObject {
     try { this.sql.exec("ALTER TABLE players ADD COLUMN credit_at INTEGER NOT NULL DEFAULT 0"); } catch {}
     try { this.sql.exec("ALTER TABLE players ADD COLUMN owned TEXT NOT NULL DEFAULT '[]'"); } catch {}
     try { this.sql.exec("ALTER TABLE players ADD COLUMN equip TEXT NOT NULL DEFAULT '{}'"); } catch {}
+    try { this.sql.exec("ALTER TABLE players ADD COLUMN save TEXT"); } catch {} // saved co-op game (null = none)
   }
 
   roomUpdate(code, players, mode, names, priv, level) {
@@ -252,7 +255,7 @@ export class Board extends DurableObject {
     const token = randomToken();
     this.sql.exec("INSERT INTO players (name, lname, token, created) VALUES (?, ?, ?, ?)",
       name, name.toLowerCase(), await sha256(token), Date.now());
-    return { token, profile: { name, xp: 0, bestScore: 0, bestLevel: 0, pvpKills: 0, admin: isAdmin(this.env, name), ach: [], credits: 0, owned: [], equip: {} } };
+    return { token, profile: { name, xp: 0, bestScore: 0, bestLevel: 0, pvpKills: 0, admin: isAdmin(this.env, name), ach: [], credits: 0, owned: [], equip: {}, save: null } };
   }
 
   async find(token) {
@@ -305,7 +308,8 @@ export class Board extends DurableObject {
     const r = await this.find(token);
     return r ? { name: r.name, xp: r.xp, bestScore: r.best_score, bestLevel: r.best_level, pvpKills: r.pvp_kills,
       admin: isAdmin(this.env, r.name), ach: JSON.parse(r.ach || "[]"), banned: r.banned || null, muted: !!r.muted,
-      credits: r.credits || 0, owned: JSON.parse(r.owned || "[]"), equip: JSON.parse(r.equip || "{}") } : null;
+      credits: r.credits || 0, owned: JSON.parse(r.owned || "[]"), equip: JSON.parse(r.equip || "{}"),
+      save: r.save ? JSON.parse(r.save) : null } : null;
   }
 
   async submit(token, s) {
@@ -324,6 +328,18 @@ export class Board extends DurableObject {
       this.sql.exec("UPDATE players SET credits = credits + ?, credit_at = ? WHERE id = ?", accepted, now, r.id);
     }
     return { profile: await this.login(token), accepted };
+  }
+
+  // One save slot per account: the level you reached in your own co-op room, your upgrades and score
+  async saveGame(token, g) {
+    const r = await this.find(token);
+    if (!r) return { error: "Unknown login code" };
+    if (!g || typeof g !== "object") return { error: "Bad save" };
+    const up = {};
+    for (const k in UP_MAX) up[k] = Math.min(UP_MAX[k], clamp(g.up && g.up[k], 99));
+    const save = { level: Math.max(1, clamp(g.level, 9999)), score: clamp(g.score, 1e8), up, picks: clamp(g.picks, 50), at: Date.now() };
+    this.sql.exec("UPDATE players SET save = ? WHERE id = ?", JSON.stringify(save), r.id);
+    return { ok: true, save };
   }
 
   async buy(token, slot, i) {
@@ -443,6 +459,7 @@ async function api(request, url, env, board) {
       return json({ ...r, online: hit > 0 });
     }
     case "/api/submit": { const r = await board.submit(body.token, body); return r ? json(r) : json({ error: "Unknown login code" }, 404); }
+    case "/api/save": { const r = await board.saveGame(body.token, body.save); return json(r, r.error ? 400 : 200); }
     case "/api/buy": { const r = await board.buy(body.token, String(body.slot || ""), body.i); return json(r, r.error ? 400 : 200); }
     case "/api/equip": { const r = await board.equip(body.token, String(body.slot || ""), body.i); return json(r, r.error ? 400 : 200); }
     case "/api/admin/credits": { const r = await board.adminCredits(body.token, body.target, body.amount); return json(r, r.error ? 403 : 200); }

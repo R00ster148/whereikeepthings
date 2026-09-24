@@ -23,7 +23,7 @@ const DELAY = 110; // starting playback delay; each player's actual delay adapts
 const NADE_SHOTS = 24, NADE_CD = 480;
 // PvP free-for-all: fixed arena, first to KILLS_TO_WIN, bullet damage decided by the player who gets hit
 const TEAM_COLORS = [[40, 150, 255], [255, 60, 70]], TEAM_NAMES = ["Blue", "Red"], TDM_TO_WIN = 30;
-const ARENA = 1200, KILLS_TO_WIN = 15, PVP_DMG = 8, PVP_NADE_DMG = 12, PVP_RESPAWN = 3;
+const ARENA = 1200, KILLS_TO_WIN = 15, PVP_DMG = 8, PVP_NADE_DMG = 12, PVP_RESPAWN = 3, PVP_KILL_CREDITS = 500;
 let arena = false; // grenade: 24 shots, recharges in 8 seconds
 const SEND_HZ = 15, MAX_SHOTS = 4, KEEPALIVE_MS = 30000, MAX_PLAYERS = 8, MAX_ENEMIES = 80, MAX_EVENTS = 20;
 const ROOM_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -355,12 +355,12 @@ function clearPath(x0, y0, x1, y1, r) { // same, for something r pixels wide (ch
   const l = Math.hypot(x1 - x0, y1 - y0) || 1, ox = -(y1 - y0) / l * r, oy = (x1 - x0) / l * r;
   return clearLine(x0, y0, x1, y1) && clearLine(x0 + ox, y0 + oy, x1 + ox, y1 + oy) && clearLine(x0 - ox, y0 - oy, x1 - ox, y1 - oy);
 }
-function freeSpotNear(cx, cy, minR = 0) {
+function freeSpotNear(cx, cy, minR = 0, size = 18) {
   const a0 = Math.random() * TAU;
   for (let r = minR; r < 1500; r += 30) {
     for (let i = 0; i < 12; i++) {
       const a = a0 + i * TAU / 12, p = new V(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
-      if (!getWalls(p).some(w => overlaps(p, 18, w))) return p;
+      if (!getWalls(p).some(w => overlaps(p, size, w))) return p;
       if (r === 0) break;
     }
   }
@@ -413,6 +413,23 @@ function drawBadge(x, y, r, s = 1) { // chevrons: 1-4 per tier
   ctx.restore();
 }
 
+// ---------- Cosmetics shop (bought with credits = points earned in game) ----------
+// Prices must match SHOP in src/index.js, which is what actually charges you.
+const COSMETICS = {
+  skin: { label: "Ships", items: [["Square", 0], ["Diamond", 15000], ["Circle", 30000], ["Triangle", 50000], ["Hexagon", 80000], ["Star", 150000], ["Twin Core", 400000]] },
+  trail: { label: "Trails", items: [["Classic", 0], ["Sparks", 20000], ["Ribbon", 40000], ["Comet", 60000], ["Pixels", 90000], ["Helix", 200000]] },
+  aura: { label: "Auras", items: [["None", 0], ["Halo", 25000], ["Orbiters", 70000], ["Pulse", 120000], ["Nova", 250000]] },
+  tag: { label: "Name tags", items: [["Player colour", 0], ["Ice", 60000], ["Gold", 100000], ["Rainbow", 500000]] },
+};
+const SLOTS = ["skin", "trail", "aura", "tag"];
+const NO_COS = { skin: 0, trail: 0, aura: 0, tag: 0 };
+const equipped = () => { const e = (profile && profile.equip) || {}; return { skin: e.skin | 0, trail: e.trail | 0, aura: e.aura | 0, tag: e.tag | 0 }; };
+const owns = (slot, i) => i === 0 || !!(profile && (profile.owned || []).includes(`${slot}:${i}`));
+// Worn cosmetics travel in the player flags (bits 13+), so everyone sees them
+const cosFlags = c => (c.skin << 13) | (c.trail << 17) | (c.aura << 21) | (c.tag << 25);
+const cosOf = fl => ({ skin: (fl >> 13) & 15, trail: (fl >> 17) & 15, aura: (fl >> 21) & 15, tag: (fl >> 25) & 15 });
+const tagColor = (tag, base) => tag === 1 ? [150, 230, 255] : tag === 2 ? C.gold : tag === 3 ? hue((anim * 0.1) % 1) : base;
+
 const UPGRADES = [
   { k: "rate", name: "Rapid fire", desc: "Shoot faster", max: 4 },
   { k: "dmg", name: "Heavy rounds", desc: "+1 damage per bullet", max: 5 },
@@ -430,7 +447,7 @@ const nadeShots = g => Math.min(48, NADE_SHOTS + cleared(g));            // 24 -
 const nadeDelay = g => Math.max(240, NADE_CD - 8 * cleared(g));          // 8s -> 4s
 const nadeDmg = g => (1 + g.up.dmg) * Math.min(3, 2 + 0.05 * cleared(g)); // x2 -> x3 your bullet damage
 
-// Enemy types. 4 shoots back, 9-11 are bosses.
+// Enemy types. 4 shoots back, 9 and up are bosses (sides = outline shape, hpMul scales boss health).
 const TIERS = {
   1: { hp: 3, speed: 4.4, size: 10, color: C.weak, pts: 150, xp: 5 },
   2: { hp: 10, speed: 2.8, size: 18, color: C.mid, pts: 300, xp: 10 },
@@ -440,10 +457,19 @@ const TIERS = {
   6: { hp: 8, speed: 2.5, size: 14, color: [140, 255, 60], pts: 350, xp: 12, dasher: true, name: "Dasher" },
   7: { hp: 18, speed: 2.2, size: 22, color: [0, 230, 200], pts: 400, xp: 12, splitter: true, name: "Splitter" },
   8: { hp: 3, speed: 4.8, size: 9, color: [0, 230, 200], pts: 100, xp: 4, piece: true },
-  9: { hp: 300, speed: 1.1, size: 50, color: [255, 60, 90], pts: 5000, xp: 200, boss: "The Sentinel", dmg: 16 },
-  10: { hp: 300, speed: 1.4, size: 46, color: [60, 255, 210], pts: 5000, xp: 200, boss: "The Hydra", dmg: 16 },
-  11: { hp: 300, speed: 1.2, size: 52, color: [255, 200, 60], pts: 5000, xp: 200, boss: "The Overseer", dmg: 18 },
+  9: { hp: 300, speed: 1.1, size: 50, color: [255, 60, 90], pts: 5000, xp: 200, boss: "The Sentinel", dmg: 12, hpMul: 0.85, hint: "Weave through the gaps in its rings" },
+  10: { hp: 300, speed: 1.4, size: 46, color: [60, 255, 210], pts: 5000, xp: 200, boss: "The Hydra", dmg: 12, hpMul: 0.85, hint: "Kill its heads to break the shield" },
+  11: { hp: 300, speed: 1.2, size: 52, color: [255, 200, 60], pts: 5000, xp: 200, boss: "The Overseer", dmg: 18, hint: "Sidestep its charges" },
+  12: { hp: 300, speed: 1.3, size: 44, color: [190, 110, 255], pts: 5000, xp: 200, boss: "The Phantom", dmg: 14, sides: 5, hpMul: 0.8, hint: "It flickers, then blinks right next to you" },
+  13: { hp: 300, speed: 1.2, size: 46, color: [255, 150, 40], pts: 5000, xp: 200, boss: "The Bombardier", dmg: 12, blastDmg: 28, sides: 6, hpMul: 0.9, hint: "Get out of the red circles" },
+  14: { hp: 300, speed: 1.2, size: 48, color: [255, 90, 200], pts: 5000, xp: 200, boss: "The Swarm Queen", dmg: 12, sides: 10, hpMul: 0.9, hint: "She keeps calling in her brood" },
+  15: { hp: 300, speed: 1.0, size: 46, color: [120, 200, 255], pts: 5000, xp: 200, boss: "The Prism", dmg: 11, sides: 3, hint: "Circle with the spiral, not against it" },
+  16: { hp: 300, speed: 0.8, size: 62, color: [200, 255, 80], pts: 5000, xp: 200, boss: "The Juggernaut", dmg: 14, blastDmg: 40, sides: 4, hpMul: 1.3, hint: "Dash out of its shockwave" },
 };
+// Every 5th level brings the next boss in this order, then the list repeats
+const BOSSES = [9, 10, 11, 12, 13, 14, 15, 16];
+const bossTier = no => BOSSES[(Math.max(1, no) - 1) % BOSSES.length];
+const bossHp = (no, players, tier) => Math.round(2400 * Math.pow(no, 1.6) * (1 + 0.75 * (players - 1)) * (tierOf(tier).hpMul || 1));
 const tierOf = t => TIERS[t] || TIERS[1];
 
 // ---------- Entities ----------
@@ -565,33 +591,98 @@ class Enemy {
           dx = ux * spd; dy = uy * spd;
           this.cd -= dt;
           if (this.cd <= 0) {
-            this.cd = 2 * q; this.burst++;
-            const n = 16 + 3 * lvl, a0 = rand(0, TAU);
+            this.cd = 2.6 * q; this.burst++;
+            const n = 12 + 2 * lvl, a0 = rand(0, TAU);
             fire(g, x, y, a0, 5, n, TAU, 9);
-            if (this.burst % 2 === 0) fire(g, x, y, a0 + Math.PI / n, 3.4, n, TAU, 9);
+            if (this.burst % 3 === 0) fire(g, x, y, a0 + Math.PI / n, 3.4, n, TAU, 9);
           }
           if (this.phase > 0) {
             this.cd2 -= dt;
-            if (this.cd2 <= 0) { this.cd2 = 0.13; this.spin += 0.35; fire(g, x, y, this.spin, 5.5, 2 + this.phase, TAU, 9); }
+            if (this.cd2 <= 0) { this.cd2 = 0.2; this.spin += 0.35; fire(g, x, y, this.spin, 5.5, 1 + this.phase, TAU, 9); }
           }
         } else if (this.tier === 10) { // Hydra: shielded while 2+ of its heads are alive
           dx = ux * spd; dy = uy * spd;
           let heads = 0;
           for (const m of g.enemies.values()) if (m.owner === this.id) heads++;
-          this.shield = heads >= 2;
+          this.shield = heads >= 3;
           this.cd -= dt;
           if (this.cd <= 0) {
-            this.cd = 1.3 * q;
-            fire(g, x, y, aim, 6.5, 5 + lvl, 1.0, 10);
-            if (this.phase > 0) fire(g, x, y, aim, 4.5, 4 + lvl, 1.6, 10);
+            this.cd = 1.7 * q;
+            fire(g, x, y, aim, 6.5, 4 + lvl, 1.0, 10);
+            if (this.phase > 0) fire(g, x, y, aim, 4.5, 3 + lvl, 1.6, 10);
           }
           this.cd2 -= dt;
           if (this.cd2 <= 0) {
-            this.cd2 = 7 * q;
-            for (let i = 0; i < 3 + lvl; i++) {
-              const a = rand(0, TAU), m = spawnEnemy(g, lvl >= 2 && i % 2 ? 2 : 1, x + Math.cos(a) * 90, y + Math.sin(a) * 90);
+            this.cd2 = 9 * q;
+            for (let i = 0; i < Math.min(2 + lvl, 6 - heads); i++) { // never more than 6 heads at once
+              const a = rand(0, TAU), m = spawnEnemy(g, lvl >= 3 && i % 2 ? 2 : 1, x + Math.cos(a) * 90, y + Math.sin(a) * 90);
               if (m) m.owner = this.id;
             }
+          }
+        } else if (this.tier === 12) { // Phantom: flickers, then blinks next to a player and bursts
+          if (this.wind > 0) {
+            this.wind -= dt; this.windup = true;
+            if (this.wind <= 0) {
+              this.windup = false;
+              const a = rand(0, TAU), p = freeSpotNear(best.x + Math.cos(a) * 260, best.y + Math.sin(a) * 260, 0, this.size);
+              this.pos.set(p.x, p.y); this.ox = p.x; this.oy = p.y;
+              fire(g, p.x, p.y, rand(0, TAU), 4.2, 10 + 2 * lvl, TAU, 12);
+              if (this.phase > 0) fire(g, p.x, p.y, Math.atan2(best.y - p.y, best.x - p.x), 6, 2 + this.phase, 0.5, 12);
+            }
+          } else {
+            dx = ux * spd; dy = uy * spd;
+            this.cd -= dt;
+            if (this.cd <= 0) { this.cd = 4.5 * q; this.wind = 0.9 - 0.15 * this.phase; }
+            this.cd2 -= dt;
+            if (this.cd2 <= 0) { this.cd2 = 1.4 * q; fire(g, x, y, aim, 6, 1 + this.phase, 0.25, 12); }
+          }
+        } else if (this.tier === 13) { // Bombardier: keeps its distance and shells everyone nearby
+          if (bd > 460) { dx = ux * spd; dy = uy * spd; } else if (bd < 300) { dx = -dux * spd; dy = -duy * spd; } else { dx = -duy * spd * 0.7; dy = dux * spd * 0.7; }
+          this.cd -= dt;
+          if (this.cd <= 0) {
+            this.cd = 2.6 * q;
+            for (const t of targets) {
+              if (Math.hypot(t.x - x, t.y - y) > 900) continue;
+              for (let i = 0; i <= this.phase; i++) { const a = rand(0, TAU), off = i ? rand(70, 150) : 0; mortar(g, t.x + Math.cos(a) * off, t.y + Math.sin(a) * off, 95, 1.2, 13); }
+            }
+          }
+          this.cd2 -= dt;
+          if (this.cd2 <= 0) { this.cd2 = 1.8 * q; fire(g, x, y, aim, 5, 5 + lvl, 0.9, 13); }
+        } else if (this.tier === 14) { // Swarm Queen: calls in waves of her brood, sprays slow shots
+          dx = ux * spd; dy = uy * spd;
+          let brood = 0;
+          for (const m of g.enemies.values()) if (m.owner === this.id) brood++;
+          this.cd -= dt;
+          if (this.cd <= 0) {
+            this.cd = 6 * q;
+            for (let i = 0; i < Math.min(10 - brood, 2 + lvl + this.phase); i++) {
+              const a = rand(0, TAU), m = spawnEnemy(g, i % 3 === 2 ? 5 : i % 3 === 1 ? 6 : 1, x + Math.cos(a) * 80, y + Math.sin(a) * 80);
+              if (m) m.owner = this.id;
+            }
+          }
+          this.cd2 -= dt;
+          if (this.cd2 <= 0) {
+            this.cd2 = 1.6 * q;
+            fire(g, x, y, aim, 4.8, 5 + lvl, 1.1, 14);
+            if (this.phase === 2) fire(g, x, y, rand(0, TAU), 3.5, 12, TAU, 14);
+          }
+        } else if (this.tier === 15) { // Prism: rotating spiral arms that flip direction every few seconds
+          dx = ux * spd * 0.7; dy = uy * spd * 0.7;
+          if (!this.dir) this.dir = 1;
+          this.cd -= dt;
+          if (this.cd <= 0) { this.cd = 5; this.dir = -this.dir; }
+          this.cd2 -= dt;
+          if (this.cd2 <= 0) { this.cd2 = [0.16, 0.13, 0.11][this.phase]; this.spin += 0.13 * this.dir; fire(g, x, y, this.spin, 4.2, 3 + this.phase, TAU, 15); }
+        } else if (this.tier === 16) { // Juggernaut: slow and tough, plants itself for a big shockwave
+          if (this.wind > 0) {
+            this.wind -= dt; this.windup = true;
+            if (this.wind <= 0) { this.windup = false; if (this.phase > 0) fire(g, x, y, rand(0, TAU), 4, 14 + 4 * this.phase, TAU, 16); }
+          } else {
+            dx = ux * spd; dy = uy * spd;
+            this.cd -= dt;
+            if (this.cd <= 0) { this.cd = 4 * q; this.wind = 1.1; mortar(g, x, y, 210, 1.1, 16); }
+            this.cd2 -= dt;
+            if (this.cd2 <= 0) { this.cd2 = 1.9 * q; fire(g, x, y, aim, 6.5, 7 + lvl, 0.8, 16); }
           }
         } else { // Overseer: winds up and charges, chains charges when enraged
           if (this.charge > 0) {
@@ -655,12 +746,10 @@ class Enemy {
   get flags() { return (this.shield ? 1 : 0) | (this.windup ? 2 : 0) | (this.phase === 1 ? 4 : 0) | (this.phase === 2 ? 8 : 0) | (this.elite ? 16 : 0); }
   hits(p) { return Math.abs(p.x - this.pos.x) < this.size && Math.abs(p.y - this.pos.y) < this.size; }
   draw(cam) {
-    if (this.elite && !this.eliteDraw) { // gold glow + pulsing ring around elites
+    if (this.elite && !this.eliteDraw) { // gold glow around elites
       this.eliteDraw = true;
       ctx.save(); ctx.shadowColor = rgb(C.gold); ctx.shadowBlur = 14;
       this.draw(cam);
-      ctx.strokeStyle = rgb(C.gold, 0.55 + 0.3 * Math.sin(anim * 6)); ctx.lineWidth = 1.5;
-      ctx.beginPath(); ctx.arc(lerpX(this) - cam.x, lerpY(this) - cam.y, this.size + 9, 0, TAU); ctx.stroke();
       ctx.restore();
       this.eliteDraw = false;
       return;
@@ -672,11 +761,12 @@ class Enemy {
       const spin = 1 + this.phase * 1.5;
       if (this.windup) ctx.strokeStyle = Math.floor(anim * 8) % 2 ? "#fff" : col;
       ctx.save(); ctx.shadowColor = this.phase ? C.death : rgb(this.color); ctx.shadowBlur = 20 + this.phase * 12;
+      if (this.tier === 12) ctx.globalAlpha = 0.55 + 0.35 * Math.sin(anim * 7);
       if (this.shield) {
         ctx.save(); ctx.strokeStyle = rgb([120, 220, 255], 0.5 + 0.3 * Math.sin(anim * 5)); ctx.lineWidth = 3; ctx.setLineDash([10, 8]);
         ctx.lineDashOffset = -anim * 20; ctx.beginPath(); ctx.arc(x, y, s + 18, 0, TAU); ctx.stroke(); ctx.restore();
       }
-      ctx.lineWidth = 3; poly(x, y, s, 8, anim * 0.2 * spin); ctx.stroke();
+      ctx.lineWidth = this.tier === 16 ? 5 : 3; poly(x, y, s, this.T.sides || 8, anim * 0.2 * spin); ctx.stroke();
       ctx.shadowBlur = 0; ctx.lineWidth = 2;
       poly(x, y, s * 0.62, 4, -anim * 0.6 * spin); ctx.stroke();
       ctx.fillStyle = rgb(this.color, 0.25); poly(x, y, s * 0.3, 6, anim); ctx.fill();
@@ -747,6 +837,7 @@ class Remote {
     const fl = st[3] | 0;
     this.hp = st[2]; this.ghost = !!(fl & 1); this.dash = !!(fl & 2); this.paused = !!(fl & 4);
     this.invuln = !!(fl & 8); this.away = !!(fl & 16); this.rank = (fl >> 8) & 31; this.chat = !!(fl & 32); this.idle = this.paused || this.chat; this.score = st[4];
+    this.voice = !!(fl & 64); this.vmute = !!(fl & 128); this.cos = cosOf(fl);
   }
   update(now) {
     const want = this.targetDelay(); // move toward it gently: fast when we need more buffer, slow when shrinking
@@ -781,8 +872,141 @@ class Net {
     this.ws.onclose = e => { const was = this.alive; this.alive = false; this.onEnd && this.onEnd(was, e.code, e.reason); };
   }
   send(d) { if (this.alive && this.ws.readyState === 1) { this.ws.send(JSON.stringify(d)); this.lastSend = performance.now(); } }
+  sendRaw(d) { if (this.alive && this.ws.readyState === 1) this.ws.send(JSON.stringify(d)); }
   ping() { if (this.ws.readyState === 1) { this.ws.send("p"); this.lastSend = performance.now(); } }
   close() { this.onEnd = null; this.alive = false; try { this.ws.close(); } catch {} }
+}
+
+// ---------- Proximity voice chat ----------
+// Audio goes straight between players (WebRTC). The room server only passes the connection setup along.
+// Everyone in voice connects to everyone else in voice; how loud you hear someone depends on how close they are.
+const ICE = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
+const VOICE_NEAR = 250, VOICE_FAR = 1000; // full volume inside NEAR, silent past FAR
+const signal = (to, msg) => net && net.sendRaw(["v", to, JSON.stringify(msg)]);
+const rms = (an, buf) => { an.getByteTimeDomainData(buf); let t = 0; for (const v of buf) t += (v - 128) * (v - 128); return Math.sqrt(t / buf.length) / 128; };
+const voice = {
+  on: false, muted: false, busy: false, stream: null, ac: null, mic: null, level: 0, peers: new Map(), wait: new Map(),
+  async start() {
+    if (this.on || this.busy) return;
+    if (profile && profile.muted) { showToast("You're muted, so voice chat is off for you"); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.RTCPeerConnection) { showToast("Voice chat doesn't work in this browser"); return; }
+    this.busy = true;
+    try {
+      this.ac = this.ac || new (window.AudioContext || window.webkitAudioContext)();
+      this.ac.resume().catch(() => {}); // must start during the key press / click
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
+      this.mic = this.ac.createAnalyser(); this.mic.fftSize = 256; this.micBuf = new Uint8Array(256);
+      this.micSrc = this.ac.createMediaStreamSource(this.stream); this.micSrc.connect(this.mic);
+      this.on = true; this.muted = false;
+      showToast("Voice on: players near you can hear you.  N mutes, V leaves");
+    } catch { showToast("Microphone blocked. Allow it in your browser to use voice chat"); }
+    this.busy = false;
+    if (G && net) sendState(G, true);
+  },
+  stop() {
+    for (const id of [...this.peers.keys()]) { signal(id, { bye: 1 }); this.drop(id); }
+    if (this.stream) for (const t of this.stream.getTracks()) t.stop();
+    try { this.micSrc && this.micSrc.disconnect(); } catch {}
+    this.stream = null; this.micSrc = null; this.mic = null; this.on = false; this.muted = false; this.level = 0; this.wait.clear();
+  },
+  toggle() {
+    if (!this.on) return this.start();
+    this.stop(); showToast("Voice chat off");
+    if (G && net) sendState(G, true);
+  },
+  toggleMute() {
+    if (!this.on) return showToast("Press V to join voice chat first");
+    this.muted = !this.muted;
+    for (const t of this.stream.getAudioTracks()) t.enabled = !this.muted;
+    showToast(this.muted ? "Mic muted (N to unmute)" : "Mic on");
+    if (G && net) sendState(G, true);
+  },
+  peer(id, offer) {
+    const pc = new RTCPeerConnection({ iceServers: ICE });
+    const p = { id, pc, queue: [], made: performance.now() };
+    this.peers.set(id, p);
+    for (const t of this.stream.getTracks()) pc.addTrack(t, this.stream);
+    pc.onicecandidate = e => { if (e.candidate) signal(id, { ice: e.candidate.toJSON() }); };
+    pc.ontrack = e => this.hear(p, e.streams[0] || new MediaStream([e.track]));
+    if (offer) (async () => {
+      try { await pc.setLocalDescription(await pc.createOffer()); signal(id, { sdp: pc.localDescription.toJSON() }); }
+      catch { this.drop(id); }
+    })();
+    return p;
+  },
+  hear(p, stream) {
+    if (p.audio || this.peers.get(p.id) !== p) return;
+    // Chrome only lets WebRTC audio into Web Audio if it's also attached to a (muted) audio element
+    p.audio = new Audio(); p.audio.muted = true; p.audio.srcObject = stream; p.audio.play().catch(() => {});
+    p.src = this.ac.createMediaStreamSource(stream);
+    p.gain = this.ac.createGain(); p.gain.gain.value = 0;
+    p.an = this.ac.createAnalyser(); p.an.fftSize = 256; p.buf = new Uint8Array(256);
+    p.pan = this.ac.createStereoPanner ? this.ac.createStereoPanner() : null;
+    p.src.connect(p.an); p.src.connect(p.gain);
+    (p.pan ? (p.gain.connect(p.pan), p.pan) : p.gain).connect(this.ac.destination);
+  },
+  drop(id) {
+    const p = this.peers.get(id);
+    if (!p) return;
+    this.peers.delete(id);
+    try { p.pc.close(); } catch {}
+    if (p.audio) { p.audio.srcObject = null; }
+    for (const n of [p.src, p.gain, p.pan]) try { n && n.disconnect(); } catch {}
+  },
+  async onSignal(from, msg) {
+    if (!this.on || !msg || typeof msg !== "object") return;
+    if (msg.bye) return this.drop(from);
+    let p = this.peers.get(from);
+    try {
+      if (msg.sdp && msg.sdp.type === "offer") {
+        if (p) this.drop(from); // a fresh offer means they started over
+        p = this.peer(from, false);
+        await p.pc.setRemoteDescription(msg.sdp);
+        await p.pc.setLocalDescription(await p.pc.createAnswer());
+        signal(from, { sdp: p.pc.localDescription.toJSON() });
+      } else if (msg.sdp && msg.sdp.type === "answer" && p) await p.pc.setRemoteDescription(msg.sdp);
+      else if (msg.ice && p) { if (p.pc.remoteDescription) await p.pc.addIceCandidate(msg.ice).catch(() => {}); else p.queue.push(msg.ice); return; }
+      if (p) for (const c of p.queue.splice(0)) await p.pc.addIceCandidate(c).catch(() => {});
+    } catch { this.drop(from); }
+  },
+  // Every frame: connect to new voice players, drop stale connections, set volume and left/right by distance
+  update(g) {
+    if (!this.on || !net) return;
+    const now = performance.now();
+    this.level = this.mic && !this.muted ? rms(this.mic, this.micBuf) : 0;
+    for (const [id, o] of g.others) {
+      const p = this.peers.get(id);
+      if (!o.voice) { if (p) this.drop(id); continue; }
+      if (p) {
+        const st = p.pc.connectionState;
+        if (st === "failed" || st === "closed" || (st !== "connected" && st !== "connecting" && st !== "new" && now - p.made > 4000) || (st !== "connected" && now - p.made > 15000)) this.drop(id);
+      } else if (net.id < id && now > (this.wait.get(id) || 0)) { // the earlier-joined player makes the call, so both sides never call at once
+        this.wait.set(id, now + 5000);
+        this.peer(id, true);
+      }
+    }
+    for (const id of [...this.peers.keys()]) if (!g.others.has(id)) this.drop(id);
+    const t = this.ac.currentTime;
+    for (const p of this.peers.values()) {
+      const o = g.others.get(p.id);
+      if (!o || !p.gain) continue;
+      const dx = o.pos.x - g.pos.x, dy = o.pos.y - g.pos.y, d = Math.hypot(dx, dy);
+      const v = d <= VOICE_NEAR ? 1 : d >= VOICE_FAR ? 0 : Math.pow(1 - (d - VOICE_NEAR) / (VOICE_FAR - VOICE_NEAR), 2);
+      p.gain.gain.setTargetAtTime(v, t, 0.1);
+      if (p.pan) p.pan.pan.setTargetAtTime(Math.max(-1, Math.min(1, dx / 700)) * 0.8, t, 0.1);
+      if (v > 0.02 && rms(p.an, p.buf) > 0.04) o.talkAt = now;
+    }
+  },
+};
+// Little mic next to a name: 0 = in voice, 1 = talking, 2 = muted
+function micIcon(x, y, st) {
+  const col = st === 1 ? rgb(C.green) : st === 2 ? C.death : C.muted;
+  ctx.save(); ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x - 2.5, y - 6, 5, 8, 2.5) : ctx.rect(x - 2.5, y - 6, 5, 8); st === 1 ? ctx.fill() : ctx.stroke();
+  ctx.beginPath(); ctx.arc(x, y - 1, 5, 0, Math.PI); ctx.moveTo(x, y + 4); ctx.lineTo(x, y + 6); ctx.stroke();
+  if (st === 2) { ctx.beginPath(); ctx.moveTo(x - 6, y - 7); ctx.lineTo(x + 6, y + 6); ctx.stroke(); }
+  if (st === 1) for (let i = 1; i <= 2; i++) { ctx.globalAlpha = 0.8 / i; ctx.beginPath(); ctx.arc(x, y - 2, 5 + i * 4, -0.6, 0.6); ctx.stroke(); }
+  ctx.restore();
 }
 
 // ---------- State ----------
@@ -836,13 +1060,22 @@ async function useCode() {
   } catch (e) { status = e.status === 404 ? "That login code doesn't exist" : "Can't reach the server."; statusErr = true; }
   busy = false;
 }
-// Best score/level/XP are sent when a level is cleared, a boss dies, or you leave
+// Credits: every point you earn fighting is also money for the shop. Held here until the next submit.
+let pendingCredits = 0;
+const earn = n => { if (profile && n > 0) pendingCredits += Math.round(n); };
+const credits = () => profile ? (profile.credits || 0) + pendingCredits : 0;
+// Best score/level/XP and new credits are sent when a level is cleared, a boss dies, or you leave
 function submitStats(beacon = false) {
-  if (!token || !G) return;
-  const body = G.pvp ? { token, score: 0, level: 0, xp, pvpKills: G.pvpBase + G.sessionKills }
+  if (!token) return;
+  const body = !G ? { token, xp } : G.pvp ? { token, score: 0, level: 0, xp, pvpKills: G.pvpBase + G.sessionKills }
     : { token, score: Math.trunc(G.score), level: G.lv.level, xp };
+  const sent = pendingCredits;
+  body.earn = sent; pendingCredits = 0;
   if (beacon && navigator.sendBeacon) { navigator.sendBeacon("/api/submit", JSON.stringify(body)); return; }
-  api("/api/submit", body).then(d => setProfile(d.profile)).catch(() => {});
+  api("/api/submit", body).then(d => {
+    pendingCredits += Math.max(0, sent - (num(d.accepted) ? d.accepted : sent)); // the server caps how fast credits come in; the rest goes next time
+    setProfile(d.profile);
+  }).catch(() => { pendingCredits += sent; });
 }
 addEventListener("pagehide", () => submitStats(true));
 async function openBoard(tab = boardTab) {
@@ -875,7 +1108,7 @@ function newGame() {
   const pos = pvp ? pvpSpawn(mates, tdm ? net.team : -1) : teamSpawn(mates);
   return {
     pos, hp: 100, score: 0, cam: new V(pos.x - W / 2, pos.y - H / 2), shake: 0,
-    trail: [], bullets: [], eshots: [], enemies: new Map(), particles: [], walls: getWalls(pos),
+    trail: [], bullets: [], eshots: [], mortars: [], enemies: new Map(), particles: [], walls: getWalls(pos),
     shotCd: 0, dashCd: 0, dashT: 0, dashDir: new V(), ghost: false, respawn: 0, invuln: 60, paused: false, away: false,
     others: new Map(), sendT: 1, lastSent: null, shots: [], hits: new Map(), kills: [], events: [],
     frame: 0, nextEid: 1, wasHost: false, color: tdm ? TEAM_COLORS[net.team] : pal(net.color), tdm, team: net.team,
@@ -897,12 +1130,13 @@ function goto(s) { state = s; sel = 0; }
 
 function connect(room, mode, pw) {
   if (net) net.close();
+  voice.stop();
   status = "Connecting"; statusErr = false;
   const n = new Net(room, mode, pw);
   net = n;
   n.onReady = () => { arena = n.mode !== "coop"; G = newGame(); goto("PLAY"); status = ""; setUrl(room); if (G.pvp) pvpStart(G); };
   n.onEnd = (was, code, reason) => {
-    submitStats();
+    submitStats(); voice.stop();
     net = null; G = null; goto("MENU"); statusErr = true; setUrl(null);
     if (code === 4003) { banReason = reason || "Banned by an admin"; goto("BANNED"); return; }
     status = code === 4001 ? `You were kicked by an admin${reason ? ": " + reason : ""}. You can rejoin in a minute.`
@@ -958,7 +1192,7 @@ function copyInvite() {
   if (navigator.clipboard) navigator.clipboard.writeText(link).then(() => showToast(msg), () => showToast(link));
   else showToast(link);
 }
-function leave() { submitStats(); if (net) net.close(); net = null; G = null; goto("MENU"); status = ""; setUrl(null); }
+function leave() { submitStats(); voice.stop(); if (net) net.close(); net = null; G = null; goto("MENU"); status = ""; setUrl(null); }
 
 // ---------- Upgrades ----------
 function rollOffer(g) {
@@ -987,6 +1221,14 @@ function onKey(e) {
   const activate = () => { const b = buttons[sel]; if (b && !b.disabled) b.action(); };
 
   if (state === "ACH") { if (e.code === "Escape" || e.code === "Enter") goto("MENU"); return; }
+  if (state === "SHOP") {
+    if (e.code === "Escape") goto("MENU");
+    else if (["Digit1", "Digit2", "Digit3", "Digit4"].includes(e.code)) { shopTab = SLOTS[+e.code.slice(5) - 1]; shopConfirm = null; }
+    else if (e.code === "ArrowUp" || e.code === "ArrowLeft") nav(-1);
+    else if (e.code === "ArrowDown" || e.code === "ArrowRight") nav(1);
+    else if (e.code === "Enter" || e.code === "Space") activate();
+    return;
+  }
   if (state === "BANNED") return;
   if (state === "HOST") {
     if (e.code === "Escape") goto("MENU");
@@ -1031,6 +1273,7 @@ function onKey(e) {
     else if (e.code === "KeyP") hostPvp();
     else if (e.code === "KeyM") playMain();
     else if (e.code === "KeyA") goto("ACH");
+    else if (e.code === "KeyB") openShop();
     else if (e.code === "KeyJ") openJoin();
     else if (e.code === "KeyL") openBoard();
     else if (e.code === "KeyK") copyLoginCode();
@@ -1055,12 +1298,16 @@ function onKey(e) {
     if (G.paused) {
       if (e.code === "Escape") resume();
       else if (e.code === "KeyC") copyInvite();
+      else if (e.code === "KeyV") voice.toggle();
+      else if (e.code === "KeyN") voice.toggleMute();
       else if (e.code === "ArrowUp" || e.code === "KeyW") nav(-1);
       else if (e.code === "ArrowDown" || e.code === "KeyS") nav(1);
       else if (e.code === "Enter" || e.code === "Space") activate();
     } else if (e.code === "Escape") pause();
     else if (e.code === "KeyT" || e.code === "Enter") openChat();
     else if (e.code === "KeyC") copyInvite();
+    else if (e.code === "KeyV") voice.toggle();
+    else if (e.code === "KeyN") voice.toggleMute();
     else if (["Digit1", "Digit2", "Digit3"].includes(e.code) && showCards(G)) pickUpgrade(+e.code.slice(5) - 1);
   }
 }
@@ -1083,6 +1330,7 @@ const ACH = [
   ["clear30", "Into the Void", "Clear level 30", 10000],
   ["boss_slayer", "Boss Slayer", "Land the final hit on a boss", 1000],
   ["full_set", "Full Set", "Defeat the Sentinel, Hydra and Overseer", 3000],
+  ["collector", "Boss Collector", "Defeat all 8 bosses", 8000],
   ["untouchable", "Untouchable", "Clear a boss level without taking damage", 5000],
   ["grenadier", "Grenadier", "Kill 5 enemies with one grenade", 800],
   ["too_slow", "Too Slow", "Kill 25 kamikazes before they explode", 800],
@@ -1134,6 +1382,7 @@ const COMMANDS = {
   help: "/help  list commands",
   rank: "/rank <1-30 or rank name> [player]  set a rank",
   xp: "/xp <amount>  add XP",
+  credits: "/credits <amount> [player]  give credits (negative takes them away)",
   god: "/god  toggle invincibility",
   heal: "/heal  full hull (revives you too)",
   nade: "/nade  recharge grenade and dash",
@@ -1217,6 +1466,15 @@ async function runCommand(g, line) {
       const n = Math.max(0, Math.min(1e7, parseInt(args[0], 10) || 0));
       addXp(n); submitStats(); return sys(g, `+${n.toLocaleString()} XP`);
     }
+    case "credits": {
+      const n = parseInt(args[0], 10);
+      if (!Number.isFinite(n)) return sys(g, "Usage: " + COMMANDS.credits);
+      try {
+        const res = await api("/api/admin/credits", { token, target: args.slice(1).join(" ") || null, amount: n });
+        if (res.name === profile.name) profile.credits = res.credits;
+        return sys(g, `${res.name} now has ${res.credits.toLocaleString()} credits`);
+      } catch (e) { return sys(g, e.message || "Couldn't change credits"); }
+    }
     case "rank": {
       const all = args.join(" ").toLowerCase();
       let r = RANKS.findIndex(n => n.toLowerCase() === all), target = null;
@@ -1255,14 +1513,14 @@ function runWorld(g, cmd, args, from) {
       return "All enemies destroyed";
     case "level": {
       const n = Math.max(1, Math.min(999, parseInt(args[0], 10) || 1));
-      g.enemies.clear(); g.eshots = [];
+      g.enemies.clear(); g.eshots = []; g.mortars = [];
       L.level = n; L.phase = 0; L.timer = 3; L.toSpawn = 0; L.bossMax = 0;
       return `Jumping to level ${n}`;
     }
     case "boss": {
       const bossNo = Math.max(1, Math.round(L.level / 5)), n = 1 + g.others.size, a = rand(0, TAU);
-      const hp = Math.round(2400 * Math.pow(bossNo, 1.6) * (1 + 0.75 * (n - 1)));
-      const e = spawnEnemy(g, 9 + ((bossNo - 1) % 3), who.x + Math.cos(a) * 500, who.y + Math.sin(a) * 500, hp);
+      const tier = bossTier(bossNo), hp = bossHp(bossNo, n, tier);
+      const e = spawnEnemy(g, tier, who.x + Math.cos(a) * 500, who.y + Math.sin(a) * 500, hp);
       if (!e) return "Too many enemies to spawn a boss";
       L.bossMax = hp; return `${e.T.boss} spawned`;
     }
@@ -1303,13 +1561,13 @@ function onKill(g, id, killer, tier) {
   const mult = e && e.elite ? 2 : 1;
   if (e) { boom(g, e); g.enemies.delete(id); }
   if (killer === net.id) {
-    g.score += T.pts * mult; addXp(T.xp * mult);
+    g.score += T.pts * mult; earn(T.pts * mult); addXp(T.xp * mult);
     g.sKills++; unlock("first_blood");
     if (g.sKills >= 100) unlock("century");
     if (bumpLife("kills") >= 1000) unlock("exterminator");
     if (T.kamikaze && bumpLife("kamikaze") >= 25) unlock("too_slow");
     if (T.piece && bumpLife("pieces") >= 50) unlock("divide");
-    if (T.boss) { unlock("boss_slayer"); if (addLifeSet("bosses", T.boss) >= 3) unlock("full_set"); }
+    if (T.boss) { unlock("boss_slayer"); const n = addLifeSet("bosses", T.boss); if (n >= 3) unlock("full_set"); if (n >= BOSSES.length) unlock("collector"); }
     if (g.score >= 100000 && !g.pvp) unlock("six_figures");
     const nid = g.nadeTouch.get(id);
     if (nid) { const c = (g.nadeKills.get(nid) || 0) + 1; g.nadeKills.set(nid, c); if (c >= 5) unlock("grenadier"); }
@@ -1317,12 +1575,12 @@ function onKill(g, id, killer, tier) {
   if (T.boss) {
     addXp(100);
     submitStats();
-    g.eshots = [];
+    g.eshots = []; g.mortars = [];
     banner(`${T.boss} destroyed`, `${nameOf(g, killer)} landed the final shot`, T.color, 3);
   }
 }
 function damageEnemy(g, e, dmg, killer) { // host only
-  if (e.shield) dmg *= 0.2;
+  if (e.shield) dmg *= 0.4;
   e.hp -= dmg; e.flash = 3;
   if (e.hp <= 0) killEnemy(g, e, killer);
 }
@@ -1354,12 +1612,12 @@ function blast(g, x, y, r, dmg, color) {
 
 // Level transitions: the host triggers these, everyone else sees them from the host's level info
 function onLevelStart(g) {
-  g.eshots = [];
+  g.eshots = []; g.mortars = [];
   const L = g.lv;
   g.hurtLevel = 0; g.lastHp = g.hp; g.watchLevel = L.level; // saw this level from the start
   if (L.level % 5 === 0) {
-    const T = TIERS[9 + ((L.level / 5 - 1) % 3)];
-    banner(`Level ${L.level}`, `Boss incoming: ${T.boss}`, T.color, 3);
+    const T = TIERS[bossTier(L.level / 5)];
+    banner(`Level ${L.level}`, `Boss incoming: ${T.boss}. ${T.hint}`, T.color, 3.5);
   } else {
     const NEW = { 1: "Clear every enemy to advance", 2: "New enemy: splitters break into three pieces",
       3: "Elite enemies glow gold: double health, faster, double points",
@@ -1368,7 +1626,7 @@ function onLevelStart(g) {
   }
 }
 function onLevelClear(g, prev) {
-  g.eshots = [];
+  g.eshots = []; g.mortars = [];
   g.picks++;
   if (!g.offer) rollOffer(g);
   addXp(10 * prev);
@@ -1385,7 +1643,7 @@ function onLevelClear(g, prev) {
   banner(`Level ${prev} cleared`, "Hull repaired, dash and grenade improved. Pick an upgrade: 1, 2 or 3", C.green);
 }
 function onWipe(g) {
-  g.eshots = [];
+  g.eshots = []; g.mortars = [];
   banner("Squad wiped", `Restarting level ${g.lv.level}`, [255, 0, 50], 3);
 }
 
@@ -1421,7 +1679,7 @@ function onPvpKill(g, killer, victim) {
   const kc = killer === net.id ? g.color : (g.others.get(killer) || {}).color || C.white;
   addChat(g, displayName(g, killer), kc, `eliminated ${displayName(g, victim)}`, true);
   if (killer === net.id && victim !== net.id) {
-    g.score++; g.sessionKills++; addXp(25);
+    g.score++; g.sessionKills++; addXp(25); earn(PVP_KILL_CREDITS);
     g.streak++; unlock("gladiator");
     if (g.streak >= 5) unlock("on_fire");
     if (g.streak >= 10) unlock("unstoppable");
@@ -1448,7 +1706,7 @@ function pvpTick(g, dt) {
     const k = teamKills(g), w = k[0] >= TDM_TO_WIN ? 0 : k[1] >= TDM_TO_WIN ? 1 : -1;
     if (w >= 0) {
       R.over = true; R.timer = 8; R.winner = `${TEAM_NAMES[w]} team`;
-      if (w === g.team) { addXp(150); unlock("team_player"); banner("Your team wins!", "Next round in 8 seconds", C.gold, 4); }
+      if (w === g.team) { addXp(150); earn(1500); unlock("team_player"); banner("Your team wins!", "Next round in 8 seconds", C.gold, 4); }
       else banner(`${TEAM_NAMES[w]} team wins`, "Next round in 8 seconds", TEAM_COLORS[w], 4);
       submitStats();
     }
@@ -1458,7 +1716,7 @@ function pvpTick(g, dt) {
   for (const [id, o] of g.others) if (!winner && o.score >= KILLS_TO_WIN) winner = id;
   if (winner) {
     R.over = true; R.timer = 8; R.winner = displayName(g, winner);
-    if (winner === net.id) { addXp(150); unlock("champion"); banner("You win the round!", "Next round in 8 seconds", C.gold, 4); }
+    if (winner === net.id) { addXp(150); earn(2000); unlock("champion"); banner("You win the round!", "Next round in 8 seconds", C.gold, 4); }
     else banner(`${R.winner} wins the round`, "Next round in 8 seconds", C.gold, 4);
     submitStats();
   }
@@ -1481,7 +1739,10 @@ function fire(g, x, y, a, spd, n, spread, tier) {
   spawnShots(g, x, y, a, spd, n, spread, tier, 0);
   if (g.events.length < MAX_EVENTS) g.events.push([Math.round(x), Math.round(y), Math.round(a * 1000) / 1000, spd, n, spread, tier, g.frame]);
 }
+// A marked circle that explodes after `delay` seconds (sent as an attack with n = -1, spd = delay, spread = radius)
+function mortar(g, x, y, r, delay, tier) { fire(g, x, y, 0, delay, -1, r, tier); }
 function spawnShots(g, x, y, a, spd, n, spread, tier, age) {
+  if ((n | 0) === -1) { g.mortars.push({ x, y, r: Math.min(300, spread), t: Math.max(0.1, spd - age * STEP), max: Math.max(0.1, spd), tier }); return; }
   if ((n | 0) === 0) { const T = tierOf(tier); blast(g, x, y, spread, T.blastDmg || 30, T.color); return; } // an explosion
   n = Math.min(40, Math.max(1, n | 0));
   for (let i = 0; i < n; i++) {
@@ -1582,8 +1843,8 @@ function startLevel(g, targets, players) {
   if (L.level % 5 === 0) {
     L.toSpawn = Math.round(L.toSpawn * 0.5);
     const t = targets[0] || g.pos, a = rand(0, TAU), bossNo = L.level / 5;
-    const hp = Math.round(2400 * Math.pow(bossNo, 1.6) * (1 + 0.75 * (n - 1)));
-    const e = spawnEnemy(g, 9 + ((bossNo - 1) % 3), t.x + Math.cos(a) * 600, t.y + Math.sin(a) * 600, hp);
+    const tier = bossTier(bossNo), hp = bossHp(bossNo, n, tier);
+    const e = spawnEnemy(g, tier, t.x + Math.cos(a) * 600, t.y + Math.sin(a) * 600, hp);
     if (e) L.bossMax = hp;
   }
   L.remaining = L.toSpawn + g.enemies.size;
@@ -1641,7 +1902,11 @@ function updatePlay(g, dt) {
       banner("Announcement", m[1], C.gold, 5);
     } else if (m[0] === "s" && typeof m[1] === "string") {
       addChat(g, "Server", C.gold, m[1], true);
+    } else if (m[0] === "v" && typeof m[1] === "string" && typeof m[2] === "string") {
+      let d = null; try { d = JSON.parse(m[2]); } catch {}
+      voice.onSignal(m[1], d);
     } else if (m[0] === "l") {
+      voice.drop(m[1]);
       const o = g.others.get(m[1]);
       if (o) addChat(g, o.name, o.color, "left the room", true);
       g.others.delete(m[1]);
@@ -1651,6 +1916,7 @@ function updatePlay(g, dt) {
     if (now - (o.heard || now) > 8000) { addChat(g, o.name, o.color, "disconnected", true); g.others.delete(id); continue; }
     o.update(now);
   }
+  voice.update(g);
   // Release scheduled shots whose time has come (catching up any part of a frame we missed)
   if (g.pendingShots.length) g.pendingShots = g.pendingShots.filter(p => {
     if (p.due > now) return true;
@@ -1737,6 +2003,8 @@ function updatePlay(g, dt) {
     g.bullets = g.bullets.filter(b => !b.dead);
     for (const s of g.eshots) s.update();
     g.eshots = g.eshots.filter(s => s.life > 0);
+    for (const m of g.mortars) if ((m.t -= dt) <= 0) { const T = tierOf(m.tier); blast(g, m.x, m.y, m.r, T.blastDmg || 25, T.color); }
+    g.mortars = g.mortars.filter(m => m.t > 0);
   } else for (const o of [...g.bullets, ...g.eshots, ...g.enemies.values()]) { o.ox = o.pos.x; o.oy = o.pos.y; } // hold still
   for (const p of g.particles) p.update();
   g.particles = g.particles.filter(p => p.life > 0);
@@ -1751,7 +2019,8 @@ function updatePlay(g, dt) {
 // One message per tick carries your state, shots and hits, plus (if host) enemies, level and enemy attacks.
 // Nothing changed = nothing sent.
 function sendState(g, force, hosting = hostId(g) === net.id) {
-  const flags = (g.ghost ? 1 : 0) | (g.dashT > 0 ? 2 : 0) | (g.paused ? 4 : 0) | (g.invuln > 0 ? 8 : 0) | (g.away ? 16 : 0) | (g.chatting ? 32 : 0) | (rankOf(xp) << 8);
+  const flags = (g.ghost ? 1 : 0) | (g.dashT > 0 ? 2 : 0) | (g.paused ? 4 : 0) | (g.invuln > 0 ? 8 : 0) | (g.away ? 16 : 0) | (g.chatting ? 32 : 0) | (voice.on ? 64 : 0) | (voice.on && voice.muted ? 128 : 0)
+    | (rankOf(xp) << 8) | cosFlags(equipped());
   const st = [Math.round(g.pos.x), Math.round(g.pos.y), Math.round(g.hp / maxHp(g) * 100), flags, Math.trunc(g.score)];
   st.push(Math.round(g.vel.x * 10), Math.round(g.vel.y * 10)); // how fast you're moving, so others can glide smoothly
   const changed = !g.lastSent || st.some((v, i) => v !== g.lastSent[i]);
@@ -1875,6 +2144,7 @@ function render() {
   else if (state === "JOIN") drawJoin();
   else if (state === "HOST") drawHost();
   else if (state === "ACH") drawAch();
+  else if (state === "SHOP") drawShop();
   else if (state === "BANNED") drawBanned();
   else if (state === "PASS") drawPass();
   else if (state === "LOADING") drawLoading();
@@ -1922,34 +2192,36 @@ function rankLine(x, y, w) { // badge, rank name, progress to next
 }
 
 function drawMenu() {
-  drawTitle(150, 96);
+  drawTitle(128, 92);
   const bx = W / 2 - 170, bw = 340;
-  if (status) text(status + (net || status === "Checking room" ? ".".repeat(1 + Math.floor(anim * 2) % 3) : ""), W / 2, 208, f(16, 600), statusErr ? C.death : C.text, "center");
-  else text("Co-op survival and PvP for up to 8 players", W / 2, 208, f(18, 500), C.muted, "center");
+  if (status) text(status + (net || status === "Checking room" ? ".".repeat(1 + Math.floor(anim * 2) % 3) : ""), W / 2, 184, f(16, 600), statusErr ? C.death : C.text, "center");
+  else text("Co-op survival and PvP for up to 8 players", W / 2, 184, f(18, 500), C.muted, "center");
   if (!net) {
     const mainRow = rooms && rooms.find(r => r[0] === "MAIN");
-    button(mainRow ? `Main room: level ${mainRow[5] || 1}` : "Play the main room", "M", bx, 240, bw, 42, playMain);
-    button("Host co-op", "H", bx, 288, bw, 42, host);
-    button("Host PvP (FFA or teams)", "P", bx, 336, bw, 42, hostPvp);
-    button("Join a room", "J", bx, 384, bw, 42, openJoin);
-    button("Leaderboard", "L", bx, 432, bw, 42, () => openBoard());
+    button(mainRow ? `Main room: level ${mainRow[5] || 1}` : "Play the main room", "M", bx, 216, bw, 40, playMain);
+    button("Host co-op", "H", bx, 260, bw, 40, host);
+    button("Host PvP (FFA or teams)", "P", bx, 304, bw, 40, hostPvp);
+    button("Join a room", "J", bx, 348, bw, 40, openJoin);
+    button("Shop", "B", bx, 392, bw, 40, openShop);
+    button("Leaderboard", "L", bx, 436, bw, 40, () => openBoard());
     const got = profile ? ACH.filter(a => hasAch(a[0])).length : 0;
-    button(`Achievements  ${got}/${ACH.length}`, "A", bx, 480, bw, 42, () => goto("ACH"));
+    button(`Achievements  ${got}/${ACH.length}`, "A", bx, 480, bw, 40, () => goto("ACH"));
   }
   if (profile) {
     const r = rankOf(xp), next = RANK_XP[r + 1];
-    panel(bx, 534, bw, 134, 10);
-    text(profile.name, bx + 20, 546, f(22, 700), C.text);
-    if (profile.admin) { ctx.font = f(22, 700); text("ADMIN", bx + 30 + ctx.measureText(profile.name).width, 552, f(12, 700), rgb(C.gold)); }
+    panel(bx, 532, bw, 154, 10);
+    text(profile.name, bx + 20, 544, f(22, 700), C.text);
+    if (profile.admin) { ctx.font = f(22, 700); text("ADMIN", bx + 30 + ctx.measureText(profile.name).width, 550, f(12, 700), rgb(C.gold)); }
     // this rank's trail colour
-    for (let i = 0; i < 6; i++) { ctx.strokeStyle = rgb(trailColor(r, pal(0), i / 6), 0.25 + i * 0.12); ctx.lineWidth = 1; ctx.strokeRect(bx + bw - 96 + i * 9, 550, 14, 14); }
-    rankLine(bx + 20, 580, bw - 40);
+    for (let i = 0; i < 6; i++) { ctx.strokeStyle = rgb(trailColor(r, pal(0), i / 6), 0.25 + i * 0.12); ctx.lineWidth = 1; ctx.strokeRect(bx + bw - 96 + i * 9, 548, 14, 14); }
+    rankLine(bx + 20, 578, bw - 40);
     text(next ? `${xp.toLocaleString()} / ${next.toLocaleString()} XP to ${RANKS[r + 1]}` : `${xp.toLocaleString()} XP, max rank`,
-      bx + 20, 600, f(13, 500), C.muted);
-    text(`Best score ${profile.bestScore.toLocaleString()}     Best level ${profile.bestLevel}`, bx + 20, 620, f(13, 600), C.text);
-    text("K copies your login code, for playing on another device", bx + 20, 642, f(12, 500), C.muted);
+      bx + 20, 598, f(13, 500), C.muted);
+    text(`Best score ${profile.bestScore.toLocaleString()}     Best level ${profile.bestLevel}`, bx + 20, 618, f(13, 600), C.text);
+    text(`Credits ${credits().toLocaleString()}`, bx + 20, 640, f(14, 700), rgb(C.gold));
+    text("K copies your login code, for playing on another device", bx + 20, 664, f(12, 500), C.muted);
   }
-  text("WASD move    Shift dash    Space / click shoot    Q grenade    T chat    Esc pause", W / 2, H - 40, f(14, 500), C.muted, "center");
+  text("WASD move   Shift dash   Space / click shoot   Q grenade   T chat   V voice   Esc pause", W / 2, H - 40, f(14, 500), C.muted, "center");
 }
 
 function drawBanned() {
@@ -1963,9 +2235,9 @@ function drawAch() {
   const got = ACH.filter(a => hasAch(a[0])).length;
   text("Achievements", W / 2, 22, f(40, 700), C.text, "center");
   text(`${got} of ${ACH.length} unlocked. Each one gives bonus XP.`, W / 2, 70, f(15, 500), C.muted, "center");
-  const cw = 452, ch = 40, x0 = W / 2 - cw - 8;
+  const cw = 452, ch = 38, x0 = W / 2 - cw - 8;
   ACH.forEach(([id, name, desc, xpv], i) => {
-    const col = i % 2, row = Math.floor(i / 2), x = x0 + col * (cw + 16), y = 96 + row * (ch + 4), on = hasAch(id);
+    const col = i % 2, row = Math.floor(i / 2), x = x0 + col * (cw + 16), y = 96 + row * (ch + 3), on = hasAch(id);
     chamfer(x, y, cw, ch, 8);
     ctx.fillStyle = on ? "rgba(255,200,60,0.1)" : "rgba(8,10,28,0.85)"; ctx.fill();
     ctx.strokeStyle = on ? rgb(C.gold, 0.7) : "rgba(127,139,176,0.25)"; ctx.lineWidth = 1; ctx.stroke();
@@ -1979,6 +2251,63 @@ function drawAch() {
     text(`+${xpv.toLocaleString()} XP`, x + cw - 12, y + ch / 2 + 1, f(12, 700), on ? rgb(C.gold) : C.muted, "right", "middle");
   });
   button("Back", "Esc", W / 2 - 170, 682, 340, 44, () => goto("MENU"));
+}
+
+let shopTab = "skin", shopConfirm = null, shopBusy = false;
+function openShop() { if (!profile) return; goto("SHOP"); shopConfirm = null; if (pendingCredits) submitStats(); }
+async function shopClick(slot, i) {
+  if (!profile || shopBusy) return;
+  const [name, price] = COSMETICS[slot].items[i];
+  if (owns(slot, i)) {
+    if (equipped()[slot] === i) return;
+    shopBusy = true;
+    try { setProfile((await api("/api/equip", { token, slot, i })).profile); showToast(`${name} equipped`); } catch (e) { showToast(e.message); }
+    shopBusy = false; return;
+  }
+  if (credits() < price) { showToast(`You need ${(price - credits()).toLocaleString()} more credits`); return; }
+  if (shopConfirm !== slot + i) { shopConfirm = slot + i; return; } // first click asks, second click buys
+  shopBusy = true; shopConfirm = null;
+  try { setProfile((await api("/api/buy", { token, slot, i })).profile); showToast(`Bought ${name}. It's equipped!`); } catch (e) { showToast(e.message); }
+  shopBusy = false;
+}
+function drawShop() {
+  text("Shop", W / 2, 20, f(40, 700), C.text, "center");
+  text(`${credits().toLocaleString()} credits`, W / 2, 70, f(20, 700), rgb(C.gold), "center");
+  text("Every point you score in a game is a credit. Spending credits never lowers your rank.", W / 2, 98, f(13, 500), C.muted, "center");
+  SLOTS.forEach((k, i) => {
+    const x = W / 2 - 390 + i * 198;
+    button(COSMETICS[k].label, `${i + 1}`, x, 122, 186, 44, () => { shopTab = k; shopConfirm = null; });
+    if (shopTab === k) { ctx.fillStyle = rgb(C.accent); ctx.fillRect(x + 12, 170, 162, 3); }
+  });
+  const items = COSMETICS[shopTab].items, cw = 186, ch = 196, gap = 12, cols = 4, x0 = W / 2 - (cols * cw + (cols - 1) * gap) / 2;
+  const on = equipped(), have = credits();
+  items.forEach(([name, price], i) => {
+    const x = x0 + (i % cols) * (cw + gap), y = 186 + Math.floor(i / cols) * (ch + gap);
+    const b = { x, y, w: cw, h: ch, action: () => shopClick(shopTab, i) };
+    const idx = buttons.length; buttons.push(b);
+    if (usingMouse && hit(b)) sel = idx;
+    const hov = sel === idx, own = owns(shopTab, i), worn = on[shopTab] === i, asking = shopConfirm === shopTab + i;
+    chamfer(x, y, cw, ch, 12);
+    ctx.fillStyle = worn ? "rgba(0,255,120,0.08)" : hov ? "rgba(0,255,255,0.1)" : "rgba(8,10,28,0.85)"; ctx.fill();
+    ctx.strokeStyle = asking ? rgb(C.gold) : worn ? rgb(C.green, 0.8) : hov ? rgb(C.accent) : "rgba(127,139,176,0.3)"; ctx.lineWidth = hov || worn || asking ? 2 : 1; ctx.stroke();
+    // live preview: your ship flying a little loop, wearing this item
+    const cx = x + cw / 2, cy = y + 70, cos = { ...on, [shopTab]: i };
+    ctx.save(); ctx.beginPath(); ctx.rect(x + 4, y + 4, cw - 8, 128); ctx.clip();
+    if (shopTab === "tag") {
+      text(profile.name, cx, cy - 18, f(20, 700), rgb(tagColor(i, pal(0))), "center", "middle");
+      drawPlayer(new V(cx, cy + 22), [], pal(0), false, false, false, false, new V(), rankOf(xp), cos);
+    } else {
+      const pt = t => new V(cx + Math.cos(t) * 48, cy + Math.sin(t) * 22), tr = [];
+      for (let k = 0; k < 12; k++) tr.push(pt(anim * 1.2 - (11 - k) * 0.09));
+      drawPlayer(pt(anim * 1.2), tr, pal(0), false, false, false, false, new V(), rankOf(xp), cos);
+    }
+    ctx.restore();
+    text(name, cx, y + 140, f(17, 700), hov ? rgb(C.accent) : C.text, "center");
+    const [label, col] = worn ? ["Equipped", rgb(C.green)] : own ? ["Owned: click to wear", C.muted]
+      : asking ? [`Click again to buy`, rgb(C.gold)] : [`${price.toLocaleString()} credits`, have >= price ? rgb(C.gold) : C.death];
+    text(label, cx, y + 166, f(14, 700), col, "center");
+  });
+  button("Back", "Esc", W / 2 - 170, 660, 340, 48, () => goto("MENU"));
 }
 
 function drawHost() {
@@ -2163,7 +2492,53 @@ function trailColor(rank, base, k) {
   if (rank === 28) return k > 0.5 ? C.gold : [255, 255, 255];           // Omega: gold and white
   return hue((anim * 0.25 + k) % 1);                                   // Neon God: fast full rainbow
 }
-function drawPlayer(pos, trail, color, dashing, ghost, blink, faded, cam, rank = 0) {
+function shipPath(x, y, r, skin) {
+  if (skin === 3) return poly(x, y, r * 1.35, 3, -Math.PI / 2);
+  if (skin === 4) return poly(x, y, r * 1.2, 6, 0);
+  ctx.beginPath();
+  if (skin === 1) { ctx.moveTo(x, y - r * 1.3); ctx.lineTo(x + r * 1.3, y); ctx.lineTo(x, y + r * 1.3); ctx.lineTo(x - r * 1.3, y); ctx.closePath(); }
+  else if (skin === 2 || skin === 6) ctx.arc(x, y, r * 1.1, 0, TAU);
+  else if (skin === 5) {
+    for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * TAU / 10, rr = i % 2 ? r * 0.6 : r * 1.4; ctx[i ? "lineTo" : "moveTo"](x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+    ctx.closePath();
+  } else ctx.rect(x - r, y - r, r * 2, r * 2);
+}
+function drawTrail(trail, style, dashing, col, color, rank, cam) {
+  const n = trail.length;
+  trail.forEach((p, i) => {
+    const k = i / n, c = dashing ? col : trailColor(rank, color, k), a = k * (dashing ? 1 : rank ? 0.7 : 0.47);
+    const x = p.x - cam.x, y = p.y - cam.y;
+    if (style === 1) { ctx.fillStyle = rgb(c, a + 0.2); for (let j = 0; j < 2; j++) ctx.fillRect(x + rand(-10, 10), y + rand(-10, 10), 2, 2); }
+    else if (style === 2) {
+      if (!i) return;
+      const q = trail[i - 1];
+      ctx.strokeStyle = rgb(c, a); ctx.lineWidth = 2 + 10 * k; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(q.x - cam.x, q.y - cam.y); ctx.lineTo(x, y); ctx.stroke();
+    } else if (style === 3) { ctx.fillStyle = rgb(c, a * 0.8); ctx.beginPath(); ctx.arc(x, y, 2 + 8 * k, 0, TAU); ctx.fill(); }
+    else if (style === 4) { const sz = 3 + 5 * k; ctx.fillStyle = rgb(c, a + 0.15); ctx.fillRect(x - sz / 2 + ((i * 7) % 11 - 5), y - sz / 2 + ((i * 5) % 9 - 4), sz, sz); }
+    else if (style === 5) {
+      const o = Math.sin(anim * 4 + i * 0.9) * 9;
+      ctx.fillStyle = rgb(c, a + 0.2);
+      ctx.beginPath(); ctx.arc(x + o, y - o, 2.5, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.arc(x - o, y + o, 2.5, 0, TAU); ctx.fill();
+    } else { ctx.strokeStyle = rgb(c, a); ctx.lineWidth = 1; ctx.strokeRect(x - 11.5, y - 11.5, 23, 23); }
+  });
+  ctx.lineCap = "butt";
+}
+function drawAura(px, py, aura, color) {
+  if (aura === 1) { ctx.strokeStyle = rgb(color, 0.5 + 0.2 * Math.sin(anim * 3)); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(px, py, 20, 0, TAU); ctx.stroke(); }
+  else if (aura === 2) { ctx.fillStyle = rgb(color); for (let i = 0; i < 3; i++) { const a = anim * 2 + i * TAU / 3; ctx.beginPath(); ctx.arc(px + Math.cos(a) * 22, py + Math.sin(a) * 22, 3, 0, TAU); ctx.fill(); } }
+  else if (aura === 3) { for (let j = 0; j < 2; j++) { const t = (anim * 0.5 + j / 2) % 1; ctx.strokeStyle = rgb(color, 0.6 * (1 - t)); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, 14 + 22 * t, 0, TAU); ctx.stroke(); } }
+  else if (aura === 4) {
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 8; i++) {
+      const a = anim * 0.8 + i * TAU / 8, r0 = 17, r1 = 23 + 4 * Math.sin(anim * 5 + i);
+      ctx.strokeStyle = i % 2 ? rgb(C.gold) : "#fff";
+      ctx.beginPath(); ctx.moveTo(px + Math.cos(a) * r0, py + Math.sin(a) * r0); ctx.lineTo(px + Math.cos(a) * r1, py + Math.sin(a) * r1); ctx.stroke();
+    }
+  }
+}
+function drawPlayer(pos, trail, color, dashing, ghost, blink, faded, cam, rank = 0, cos = NO_COS) {
   const px = pos.x - cam.x, py = pos.y - cam.y, col = dashing ? C.white : color;
   ctx.save();
   if (faded) ctx.globalAlpha = 0.4;
@@ -2171,13 +2546,9 @@ function drawPlayer(pos, trail, color, dashing, ghost, blink, faded, cam, rank =
     ctx.strokeStyle = rgb(color, 0.3); ctx.lineWidth = 2; ctx.strokeRect(px - 19, py - 19, 38, 38);
     ctx.restore(); return;
   }
-  ctx.lineWidth = 1;
-  trail.forEach((p, i) => {
-    const k = i / trail.length;
-    ctx.strokeStyle = rgb(dashing ? col : trailColor(rank, color, k), k * (dashing ? 1 : rank ? 0.7 : 0.47));
-    ctx.strokeRect(p.x - cam.x - 11.5, p.y - cam.y - 11.5, 23, 23);
-  });
+  drawTrail(trail, cos.trail, dashing, col, color, rank, cam);
   if (blink) ctx.globalAlpha *= 0.35;
+  drawAura(px, py, cos.aura, color);
   if (dashing) { // glitch: split colour ghosts + a few torn slices
     const j = () => (Math.random() - 0.5) * 8;
     ctx.save(); ctx.globalCompositeOperation = "lighter"; ctx.lineWidth = 2;
@@ -2191,9 +2562,11 @@ function drawPlayer(pos, trail, color, dashing, ghost, blink, faded, cam, rank =
     ctx.restore();
   }
   ctx.lineWidth = 2; ctx.shadowColor = rgb(col); ctx.shadowBlur = 14;
-  ctx.strokeStyle = rgb(col); ctx.strokeRect(px - 11, py - 11, 22, 22);
+  ctx.strokeStyle = rgb(col); shipPath(px, py, 11, cos.skin); ctx.stroke();
   ctx.shadowBlur = 0;
-  ctx.fillStyle = "#fff"; ctx.fillRect(px - 8, py - 8, 16, 16);
+  ctx.fillStyle = "#fff";
+  if (cos.skin === 6) poly(px, py, 8, 4, anim * 2); else shipPath(px, py, 8, cos.skin); // Twin Core: spinning square inside a ring
+  ctx.fill();
   ctx.restore();
 }
 
@@ -2322,7 +2695,7 @@ function drawWorld(g) {
   const blinkOn = t => Math.floor(anim * 2.5) % 2 === 0 && t;
   for (const [id, o] of g.others) {
     const op = new V(lerpX(o), lerpY(o));
-    drawPlayer(op, o.trail, o.color, o.dash, o.ghost, blinkOn(o.invuln), o.idle || o.away, cam, o.rank);
+    drawPlayer(op, o.trail, o.color, o.dash, o.ghost, blinkOn(o.invuln), o.idle || o.away, cam, o.rank, o.cos || NO_COS);
     if (o.ghost) continue;
     const x = op.x - cam.x, y = op.y - cam.y;
     ctx.save(); if (o.idle || o.away) ctx.globalAlpha = 0.4;
@@ -2332,16 +2705,26 @@ function drawWorld(g) {
     ctx.font = f(12, 600);
     const lw = ctx.measureText(label).width;
     drawBadge(x - lw / 2 - 9, y - 34, o.rank, 0.8);
-    text(label, x + 6, y - 26, f(12, 600), rgb(o.color), "center", "bottom");
+    text(label, x + 6, y - 26, f(12, 600), rgb(tagColor((o.cos || NO_COS).tag, o.color)), "center", "bottom");
+    if (o.voice) micIcon(x + 6 + lw / 2 + 10, y - 33, o.vmute ? 2 : performance.now() - (o.talkAt || 0) < 250 ? 1 : 0);
     ctx.restore();
   }
-  drawPlayer(new V(g.opos.x + (g.pos.x - g.opos.x) * alpha, g.opos.y + (g.pos.y - g.opos.y) * alpha), g.trail, g.color, g.dashT > 0, g.ghost, g.invuln > 0 && Math.floor(g.invuln / 6) % 2 === 0, false, cam, rankOf(xp));
+  drawPlayer(new V(g.opos.x + (g.pos.x - g.opos.x) * alpha, g.opos.y + (g.pos.y - g.opos.y) * alpha), g.trail, g.color, g.dashT > 0, g.ghost, g.invuln > 0 && Math.floor(g.invuln / 6) % 2 === 0, false, cam, rankOf(xp), equipped());
 
   for (const b of g.bullets) b.draw(cam);
   g.rings = g.rings.filter(r => (r.t += 0.045) < 1);
   for (const r of g.rings) {
     ctx.strokeStyle = `rgba(255,120,60,${1 - r.t})`; ctx.lineWidth = 4 * (1 - r.t) + 1;
     ctx.beginPath(); ctx.arc(r.x - cam.x, r.y - cam.y, r.r * (0.3 + 0.7 * r.t), 0, TAU); ctx.stroke();
+  }
+  for (const m of g.mortars) { // incoming blast: the inner circle fills up until it goes off
+    const x = m.x - cam.x, y = m.y - cam.y, k = 1 - m.t / m.max;
+    ctx.save();
+    ctx.fillStyle = `rgba(255,40,60,${0.06 + 0.16 * k})`; ctx.beginPath(); ctx.arc(x, y, m.r, 0, TAU); ctx.fill();
+    ctx.strokeStyle = `rgba(255,60,80,${0.5 + 0.4 * k})`; ctx.lineWidth = 2; ctx.setLineDash([8, 6]); ctx.lineDashOffset = -anim * 20;
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = `rgba(255,80,90,${0.12 + 0.2 * k})`; ctx.beginPath(); ctx.arc(x, y, m.r * k, 0, TAU); ctx.fill();
+    ctx.restore();
   }
   for (const e of g.enemies.values()) e.draw(cam);
   for (const s of g.eshots) s.draw(cam);
@@ -2412,7 +2795,7 @@ function drawHud(g) {
   // Top-right: score + leaderboard
   const board = [["You", Math.trunc(g.score), g.color, true], ...[...g.others].map(([id, o]) => [short(o.name, 12), Math.trunc(o.score), o.color, false])]
     .sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const ph = 66 + board.length * 22;
+  const ph = 94 + board.length * 22;
   panel(W - 236, 16, 220, ph);
   text(g.pvp ? "Kills" : "Score", W - 220, 26, f(14, 600), C.muted);
   text(`${Math.trunc(g.score)}`, W - 32, 22, f(28, 700), C.text, "right");
@@ -2423,6 +2806,10 @@ function drawHud(g) {
     text(n, W - 204, y, f(15, me ? 700 : 500), me ? C.text : "#c8d0e8");
     text(`${s}`, W - 32, y, f(15, me ? 700 : 500), me ? C.text : "#c8d0e8", "right");
   });
+  const cy = 76 + board.length * 22;
+  ctx.fillStyle = C.edge; ctx.fillRect(W - 220, cy, 188, 1);
+  text("Credits", W - 220, cy + 8, f(14, 600), C.muted);
+  text(credits().toLocaleString(), W - 32, cy + 8, f(15, 700), rgb(C.gold), "right");
 
   drawIndicators(g);
   if (!g.paused) {
@@ -2430,7 +2817,10 @@ function drawHud(g) {
     if (!g.chatting) {
       panel(16, H - 52, 300, 36, 8);
       text(`Room ${net.room}${g.tdm ? "  TDM" : g.pvp ? "  PvP" : ""}`, 30, H - 34, f(16, 700), rgb(g.pvp ? [255, 90, 110] : C.accent), "left", "middle");
-      text("T chat    Esc menu", 302, H - 34, f(14, 500), C.muted, "right", "middle");
+      if (voice.on) {
+        micIcon(196, H - 33, voice.muted ? 2 : voice.level > 0.04 ? 1 : 0);
+        text(voice.muted ? "N unmute" : "N mute", 302, H - 34, f(14, 500), voice.muted ? C.death : C.muted, "right", "middle");
+      } else text("T chat   V voice   Esc", 302, H - 34, f(14, 500), C.muted, "right", "middle");
     }
   }
 
@@ -2482,7 +2872,7 @@ function drawCards(g) {
 
 function drawPause(g) {
   ctx.fillStyle = "rgba(2,2,10,0.7)"; ctx.fillRect(0, 0, W, H);
-  const pw = 400, ph = 370, px = W / 2 - pw / 2, py = H / 2 - ph / 2;
+  const pw = 400, ph = 434, px = W / 2 - pw / 2, py = H / 2 - ph / 2;
   chamfer(px, py, pw, ph, 16); ctx.fillStyle = "#05071a"; ctx.fill();
   panel(px, py, pw, ph, 16, rgb(C.accent, 0.5));
   text("Paused", W / 2, py + 34, f(40, 700), C.text, "center");
@@ -2490,7 +2880,8 @@ function drawPause(g) {
   const bx = px + 40, bw = pw - 80;
   button("Resume", "Esc", bx, py + 125, bw, 52, resume);
   button("Copy invite link", "C", bx, py + 189, bw, 52, copyInvite);
-  button("Leave game", "", bx, py + 253, bw, 52, leave);
+  button(voice.on ? (voice.muted ? "Voice chat: on, mic muted" : "Voice chat: on") : "Voice chat: off", "V", bx, py + 253, bw, 52, () => voice.toggle());
+  button("Leave game", "", bx, py + 317, bw, 52, leave);
   text(g.pvp ? "You can't shoot or be hit while paused" : g.others.size ? "Enemies ignore you while you're paused" : "The game is frozen while you're paused",
     W / 2, py + ph - 34, f(13, 500), C.muted, "center");
 }

@@ -1,10 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 8;
-const MAX_MSG_LEN = 6000; // room for the host's enemy list + level + boss attacks
+const MAX_MSG_LEN = 9000; // room for the host's enemy list + level + boss attacks, or a voice chat offer
 const COLORS = 8;         // 0 = blue (first player), 1-7 handed out randomly
 const NAME_RE = /^[A-Za-z0-9 _-]{3,16}$/;
 const MAIN = "MAIN";      // the always-on shared room
+// Cosmetics shop: price of every item in each slot (item 0 is free). Keep in sync with COSMETICS in public/index.html.
+const SHOP = {
+  skin: [0, 15000, 30000, 50000, 80000, 150000, 400000],
+  trail: [0, 20000, 40000, 60000, 90000, 200000],
+  aura: [0, 25000, 70000, 120000, 250000],
+  tag: [0, 60000, 100000, 500000],
+};
+const shopPrice = (slot, i) => Object.hasOwn(SHOP, slot) && Number.isInteger(i) ? SHOP[slot][i] : undefined;
 // Admins are set in wrangler.toml: ADMINS = "Name1,Name2" (account names, not case-sensitive)
 const isAdmin = (env, name) => !!name && String(env.ADMINS || "").split(",").map(n => n.trim().toLowerCase()).filter(Boolean).includes(name.toLowerCase());
 
@@ -132,10 +140,19 @@ export class Room extends DurableObject {
     if (typeof msg !== "string" || msg.length > MAX_MSG_LEN) return;
     let d;
     try { d = JSON.parse(msg); } catch { return; }
-    if (!valid(d)) return;
 
     const a = ws.deserializeAttachment();
     if (!a || a.gone) return;
+    // Voice chat setup ["v", toId, payload]: passed straight to that one player (the audio itself goes peer to peer)
+    if (Array.isArray(d) && d[0] === "v") {
+      if (a.mu || typeof d[1] !== "string" || typeof d[2] !== "string" || d[2].length > 8000) return; // muted players can't talk either
+      for (const peer of this.ctx.getWebSockets()) {
+        const b = peer.deserializeAttachment();
+        if (b && !b.gone && b.id === d[1]) { try { peer.send(JSON.stringify(["v", a.id, d[2]])); } catch {} break; }
+      }
+      return;
+    }
+    if (!valid(d)) return;
     if (d.length === 13 && !a.adm) d.length = 12; // only admins can send commands
     if (a.mu && d[9]) d[9] = null;                 // muted: chat is dropped
     a.s = d.slice(0, 5); // last state (no events) for late joiners
@@ -205,6 +222,11 @@ export class Board extends DurableObject {
     try { this.sql.exec("ALTER TABLE players ADD COLUMN last_ip TEXT"); } catch {}
     this.sql.exec("CREATE TABLE IF NOT EXISTS ipbans (ip TEXT PRIMARY KEY, name TEXT NOT NULL)");
     try { this.sql.exec("ALTER TABLE rooms ADD COLUMN level INTEGER NOT NULL DEFAULT 0"); } catch {}
+    // Credits: points earned in game, spent in the shop. Separate from XP, so buying things never lowers your rank.
+    try { this.sql.exec("ALTER TABLE players ADD COLUMN credits INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { this.sql.exec("ALTER TABLE players ADD COLUMN credit_at INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { this.sql.exec("ALTER TABLE players ADD COLUMN owned TEXT NOT NULL DEFAULT '[]'"); } catch {}
+    try { this.sql.exec("ALTER TABLE players ADD COLUMN equip TEXT NOT NULL DEFAULT '{}'"); } catch {}
   }
 
   roomUpdate(code, players, mode, names, priv, level) {
@@ -230,7 +252,7 @@ export class Board extends DurableObject {
     const token = randomToken();
     this.sql.exec("INSERT INTO players (name, lname, token, created) VALUES (?, ?, ?, ?)",
       name, name.toLowerCase(), await sha256(token), Date.now());
-    return { token, profile: { name, xp: 0, bestScore: 0, bestLevel: 0, pvpKills: 0, admin: isAdmin(this.env, name), ach: [] } };
+    return { token, profile: { name, xp: 0, bestScore: 0, bestLevel: 0, pvpKills: 0, admin: isAdmin(this.env, name), ach: [], credits: 0, owned: [], equip: {} } };
   }
 
   async find(token) {
@@ -282,7 +304,8 @@ export class Board extends DurableObject {
   async login(token) {
     const r = await this.find(token);
     return r ? { name: r.name, xp: r.xp, bestScore: r.best_score, bestLevel: r.best_level, pvpKills: r.pvp_kills,
-      admin: isAdmin(this.env, r.name), ach: JSON.parse(r.ach || "[]"), banned: r.banned || null, muted: !!r.muted } : null;
+      admin: isAdmin(this.env, r.name), ach: JSON.parse(r.ach || "[]"), banned: r.banned || null, muted: !!r.muted,
+      credits: r.credits || 0, owned: JSON.parse(r.owned || "[]"), equip: JSON.parse(r.equip || "{}") } : null;
   }
 
   async submit(token, s) {
@@ -291,7 +314,53 @@ export class Board extends DurableObject {
     this.sql.exec(`UPDATE players SET best_score = MAX(best_score, ?), best_level = MAX(best_level, ?), xp = MAX(xp, ?),
       pvp_kills = MAX(pvp_kills, ?) WHERE id = ?`,
       clamp(s.score, 1e8), clamp(s.level, 9999), clamp(s.xp, 1e8), clamp(s.pvpKills, 1e7), r.id);
-    return this.login(token);
+    // Credits earned since the last submit. Capped by time since the last payout, so a tampered client can't mint
+    // millions at once. Whatever isn't accepted stays with the client and is sent again next time.
+    let accepted = 0;
+    const earn = clamp(s.earn, 5e6);
+    if (earn > 0) {
+      const now = Date.now(), since = Math.min(600, Math.max(0, (now - (r.credit_at || 0)) / 1000));
+      accepted = Math.min(earn, Math.floor(since * 6000) + 5000);
+      this.sql.exec("UPDATE players SET credits = credits + ?, credit_at = ? WHERE id = ?", accepted, now, r.id);
+    }
+    return { profile: await this.login(token), accepted };
+  }
+
+  async buy(token, slot, i) {
+    const r = await this.find(token);
+    if (!r) return { error: "Unknown login code" };
+    const price = shopPrice(slot, i);
+    if (price === undefined) return { error: "That item doesn't exist" };
+    const owned = JSON.parse(r.owned || "[]"), key = `${slot}:${i}`;
+    if (i === 0 || owned.includes(key)) return { error: "You already own that" };
+    if ((r.credits || 0) < price) return { error: "Not enough credits" };
+    owned.push(key);
+    const equip = JSON.parse(r.equip || "{}");
+    equip[slot] = i; // wear it straight away
+    this.sql.exec("UPDATE players SET credits = credits - ?, owned = ?, equip = ? WHERE id = ?", price, JSON.stringify(owned), JSON.stringify(equip), r.id);
+    return { profile: await this.login(token) };
+  }
+
+  async equip(token, slot, i) {
+    const r = await this.find(token);
+    if (!r) return { error: "Unknown login code" };
+    if (shopPrice(slot, i) === undefined) return { error: "That item doesn't exist" };
+    if (i !== 0 && !JSON.parse(r.owned || "[]").includes(`${slot}:${i}`)) return { error: "You don't own that yet" };
+    const equip = JSON.parse(r.equip || "{}");
+    equip[slot] = i;
+    this.sql.exec("UPDATE players SET equip = ? WHERE id = ?", JSON.stringify(equip), r.id);
+    return { profile: await this.login(token) };
+  }
+
+  // Admin only: give (or with a negative amount, take) credits
+  async adminCredits(token, target, amount) {
+    const r = await this.find(token);
+    if (!r || !isAdmin(this.env, r.name)) return { error: "Not an admin" };
+    const who = target ? this.sql.exec("SELECT * FROM players WHERE lname = ?", String(target).toLowerCase()).toArray()[0] : r;
+    if (!who) return { error: `No player called ${target}` };
+    const n = Math.max(-1e9, Math.min(1e9, Math.floor(Number(amount) || 0)));
+    this.sql.exec("UPDATE players SET credits = MAX(0, credits + ?) WHERE id = ?", n, who.id);
+    return { ok: true, name: who.name, credits: this.sql.exec("SELECT credits FROM players WHERE id = ?", who.id).one().credits };
   }
 
   async unlock(token, id) {
@@ -373,7 +442,10 @@ async function api(request, url, env, board) {
       }
       return json({ ...r, online: hit > 0 });
     }
-    case "/api/submit": { const p = await board.submit(body.token, body); return p ? json({ profile: p }) : json({ error: "Unknown login code" }, 404); }
+    case "/api/submit": { const r = await board.submit(body.token, body); return r ? json(r) : json({ error: "Unknown login code" }, 404); }
+    case "/api/buy": { const r = await board.buy(body.token, String(body.slot || ""), body.i); return json(r, r.error ? 400 : 200); }
+    case "/api/equip": { const r = await board.equip(body.token, String(body.slot || ""), body.i); return json(r, r.error ? 400 : 200); }
+    case "/api/admin/credits": { const r = await board.adminCredits(body.token, body.target, body.amount); return json(r, r.error ? 403 : 200); }
     case "/api/top": return json({ rows: await board.top(url.searchParams.get("by")) });
     case "/api/rooms": return json({ rooms: await board.listRooms() });
     case "/api/ach": { const l = await board.unlock(body.token, body.id); return l ? json({ ach: l }) : json({ error: "Unknown" }, 400); }

@@ -1007,11 +1007,10 @@ class Net {
   close() { this.onEnd = null; this.alive = false; try { this.ws.close(); } catch {} }
 }
 
-// ---------- Proximity voice chat ----------
+// ---------- Voice chat ----------
 // Audio goes straight between players (WebRTC). The room server only passes the connection setup along.
-// Everyone in voice connects to everyone else in voice; how loud you hear someone depends on how close they are.
+// Everyone in voice connects to everyone else in voice and hears them at full volume, wherever they are on the map.
 const ICE = [{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "stun:stun.l.google.com:19302" }];
-const VOICE_NEAR = 250, VOICE_FAR = 1000; // full volume inside NEAR, silent past FAR
 const signal = (to, msg) => net && net.sendRaw(["v", to, JSON.stringify(msg)]);
 const rms = (an, buf) => { an.getByteTimeDomainData(buf); let t = 0; for (const v of buf) t += (v - 128) * (v - 128); return Math.sqrt(t / buf.length) / 128; };
 const voice = {
@@ -1028,7 +1027,7 @@ const voice = {
       this.mic = this.ac.createAnalyser(); this.mic.fftSize = 256; this.micBuf = new Uint8Array(256);
       this.micSrc = this.ac.createMediaStreamSource(this.stream); this.micSrc.connect(this.mic);
       this.on = true; this.muted = false;
-      showToast("Voice on: players near you can hear you.  N mutes, V leaves");
+      showToast("Voice on: everyone in voice can hear you.  N mutes, V leaves");
     } catch { showToast("Microphone blocked. Allow it in your browser to use voice chat"); }
     this.busy = false;
     if (G && net) sendState(G, true);
@@ -1069,11 +1068,8 @@ const voice = {
     // Chrome only lets WebRTC audio into Web Audio if it's also attached to a (muted) audio element
     p.audio = new Audio(); p.audio.muted = true; p.audio.srcObject = stream; p.audio.play().catch(() => {});
     p.src = this.ac.createMediaStreamSource(stream);
-    p.gain = this.ac.createGain(); p.gain.gain.value = 0;
-    p.an = this.ac.createAnalyser(); p.an.fftSize = 256; p.buf = new Uint8Array(256);
-    p.pan = this.ac.createStereoPanner ? this.ac.createStereoPanner() : null;
-    p.src.connect(p.an); p.src.connect(p.gain);
-    (p.pan ? (p.gain.connect(p.pan), p.pan) : p.gain).connect(this.ac.destination);
+    p.an = this.ac.createAnalyser(); p.an.fftSize = 256; p.buf = new Uint8Array(256); // for the "talking" icon
+    p.src.connect(p.an); p.src.connect(this.ac.destination);
   },
   drop(id) {
     const p = this.peers.get(id);
@@ -1081,7 +1077,7 @@ const voice = {
     this.peers.delete(id);
     try { p.pc.close(); } catch {}
     if (p.audio) { p.audio.srcObject = null; }
-    for (const n of [p.src, p.gain, p.pan]) try { n && n.disconnect(); } catch {}
+    try { p.src && p.src.disconnect(); } catch {}
   },
   async onSignal(from, msg) {
     if (!this.on || !msg || typeof msg !== "object") return;
@@ -1099,7 +1095,7 @@ const voice = {
       if (p) for (const c of p.queue.splice(0)) await p.pc.addIceCandidate(c).catch(() => {});
     } catch { this.drop(from); }
   },
-  // Every frame: connect to new voice players, drop stale connections, set volume and left/right by distance
+  // Every frame: connect to new voice players, drop stale connections, spot who's talking
   update(g) {
     if (!this.on || !net) return;
     const now = performance.now();
@@ -1116,15 +1112,9 @@ const voice = {
       }
     }
     for (const id of [...this.peers.keys()]) if (!g.others.has(id)) this.drop(id);
-    const t = this.ac.currentTime;
     for (const p of this.peers.values()) {
       const o = g.others.get(p.id);
-      if (!o || !p.gain) continue;
-      const dx = o.pos.x - g.pos.x, dy = o.pos.y - g.pos.y, d = Math.hypot(dx, dy);
-      const v = d <= VOICE_NEAR ? 1 : d >= VOICE_FAR ? 0 : Math.pow(1 - (d - VOICE_NEAR) / (VOICE_FAR - VOICE_NEAR), 2);
-      p.gain.gain.setTargetAtTime(v, t, 0.1);
-      if (p.pan) p.pan.pan.setTargetAtTime(Math.max(-1, Math.min(1, dx / 700)) * 0.8, t, 0.1);
-      if (v > 0.02 && rms(p.an, p.buf) > 0.04) o.talkAt = now;
+      if (o && p.an && rms(p.an, p.buf) > 0.04) o.talkAt = now;
     }
   },
 };
